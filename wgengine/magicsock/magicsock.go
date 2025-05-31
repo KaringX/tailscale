@@ -2468,6 +2468,10 @@ func (c *connBind) isClosed() bool {
 func (c *connBind) SetReservedForEndpoint(destination netip.AddrPort, reserved [3]byte) {
 }
 
+func (s *connBind) SendWithoutModify(bufs [][]byte, endpoint conn.Endpoint) error { //karing hiddify
+	return s.Send(bufs, endpoint)
+}
+
 // Close closes the connection.
 //
 // Only the first close does anything. Any later closes return nil.
