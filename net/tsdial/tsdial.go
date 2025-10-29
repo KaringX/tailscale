@@ -25,6 +25,7 @@ import (
 	"github.com/sagernet/tailscale/net/netknob"
 	"github.com/sagernet/tailscale/net/netmon"
 	"github.com/sagernet/tailscale/net/netns"
+	"github.com/sagernet/tailscale/net/netx"
 	"github.com/sagernet/tailscale/net/tsaddr"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/types/netmap"
@@ -75,6 +76,7 @@ type Dialer struct {
 
 	netnsDialerOnce sync.Once
 	netnsDialer     netns.Dialer
+	sysDialForTest  netx.DialFunc // or nil
 
 	routes atomic.Pointer[bart.Table[bool]] // or nil if UserDial should not use routes. `true` indicates routes that point into the Tailscale interface
 
@@ -153,6 +155,7 @@ func (d *Dialer) SetRoutes(routes, localRoutes []netip.Prefix) {
 		for _, r := range localRoutes {
 			rt.Insert(r, false)
 		}
+		d.logf("tsdial: bart table size: %d", rt.Size())
 	}
 
 	d.routes.Store(rt)
@@ -247,7 +250,7 @@ func changeAffectsConn(delta *netmon.ChangeDelta, conn net.Conn) bool {
 	// In a few cases, we don't have a new DefaultRouteInterface (e.g. on
 	// Android; see tailscale/corp#19124); if so, pessimistically assume
 	// that all connections are affected.
-	if delta.New.DefaultRouteInterface == "" {
+	if delta.New.DefaultRouteInterface == "" && runtime.GOOS != "plan9" {
 		return true
 	}
 
@@ -324,7 +327,7 @@ func (d *Dialer) userDialResolve(ctx context.Context, network, addr string) (net
 	}
 
 	var r net.Resolver
-	if exitDNSDoH != "" && runtime.GOOS != "windows" { // Windows: https://github.com/golang/go/issues/33097
+	if exitDNSDoH != "" {
 		r.PreferGo = true
 		r.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
 			return &dohConn{
@@ -364,6 +367,13 @@ func (d *Dialer) logf(format string, args ...any) {
 	if d.Logf != nil {
 		d.Logf(format, args...)
 	}
+}
+
+// SetSystemDialerForTest sets an alternate function to use for SystemDial
+// instead of netns.Dialer. This is intended for use with nettest.MemoryNetwork.
+func (d *Dialer) SetSystemDialerForTest(fn netx.DialFunc) {
+	testenv.AssertInTest()
+	d.sysDialForTest = fn
 }
 
 // SystemDial connects to the provided network address without going over

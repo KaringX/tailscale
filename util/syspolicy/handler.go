@@ -4,10 +4,10 @@
 package syspolicy
 
 import (
-	"github.com/sagernet/tailscale/util/syspolicy/internal"
 	"github.com/sagernet/tailscale/util/syspolicy/rsop"
 	"github.com/sagernet/tailscale/util/syspolicy/setting"
 	"github.com/sagernet/tailscale/util/syspolicy/source"
+	"github.com/sagernet/tailscale/util/testenv"
 )
 
 // TODO(nickkhyl): delete this file once other repos are updated.
@@ -38,15 +38,11 @@ func RegisterHandler(h Handler) {
 	rsop.RegisterStore("DeviceHandler", setting.DeviceScope, WrapHandler(h))
 }
 
-// TB is a subset of testing.TB that we use to set up test helpers.
-// It's defined here to avoid pulling in the testing package.
-type TB = internal.TB
-
 // SetHandlerForTest wraps and sets the specified handler as the device's policy
 // [source.Store] for the duration of tb.
 //
 // Deprecated: using [MustRegisterStoreForTest] should be preferred.
-func SetHandlerForTest(tb TB, h Handler) {
+func SetHandlerForTest(tb testenv.TB, h Handler) {
 	RegisterWellKnownSettingsForTest(tb)
 	MustRegisterStoreForTest(tb, "DeviceHandler-TestOnly", setting.DefaultScope(), WrapHandler(h))
 }

@@ -240,13 +240,14 @@ func handleC2NAppConnectorDomainRoutesGet(b *LocalBackend, w http.ResponseWriter
 	b.logf("c2n: GET /appconnector/routes received")
 
 	var res tailcfg.C2NAppConnectorDomainRoutesResponse
-	if b.appConnector == nil {
+	appConnector := b.AppConnector()
+	if appConnector == nil {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(res)
 		return
 	}
 
-	res.Domains = b.appConnector.DomainRoutes()
+	res.Domains = appConnector.DomainRoutes()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(res)
@@ -360,7 +361,7 @@ func handleC2NPostureIdentityGet(b *LocalBackend, w http.ResponseWriter, r *http
 		// and looks good in client metrics, remove this parameter and always report MAC
 		// addresses.
 		if r.FormValue("hwaddrs") == "true" {
-			res.IfaceHardwareAddrs, err = posture.GetHardwareAddrs()
+			res.IfaceHardwareAddrs, err = b.getHardwareAddrs()
 			if err != nil {
 				b.logf("c2n: GetHardwareAddrs returned error: %v", err)
 			}
@@ -442,7 +443,7 @@ func findCmdTailscale() (string, error) {
 		}
 	case "windows":
 		ts = filepath.Join(filepath.Dir(self), "tailscale.exe")
-	case "freebsd":
+	case "freebsd", "openbsd":
 		if self == "/usr/local/bin/tailscaled" {
 			ts = "/usr/local/bin/tailscale"
 		}

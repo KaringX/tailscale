@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/sagernet/tailscale/envknob"
+	"github.com/sagernet/tailscale/net/netx"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/util/cloudenv"
 	"github.com/sagernet/tailscale/util/singleflight"
@@ -61,6 +62,10 @@ type Resolver struct {
 	// Forward is the resolver to use to populate the cache.
 	// If nil, net.DefaultResolver is used.
 	Forward *net.Resolver
+
+	// LookupIPForTest, if non-nil and in tests, handles requests instead
+	// of the usual mechanisms.
+	LookupIPForTest func(ctx context.Context, host string) ([]netip.Addr, error)
 
 	// LookupIPFallback optionally provides a backup DNS mechanism
 	// to use if Forward returns an error or no results.
@@ -362,10 +367,8 @@ func (r *Resolver) addIPCache(host string, ip, ip6 netip.Addr, allIPs []netip.Ad
 	}
 }
 
-type DialContextFunc func(ctx context.Context, network, address string) (net.Conn, error)
-
 // Dialer returns a wrapped DialContext func that uses the provided dnsCache.
-func Dialer(fwd DialContextFunc, dnsCache *Resolver) DialContextFunc {
+func Dialer(fwd netx.DialFunc, dnsCache *Resolver) netx.DialFunc {
 	d := &dialer{
 		fwd:         fwd,
 		dnsCache:    dnsCache,
@@ -376,7 +379,7 @@ func Dialer(fwd DialContextFunc, dnsCache *Resolver) DialContextFunc {
 
 // dialer is the config and accumulated state for a dial func returned by Dialer.
 type dialer struct {
-	fwd      DialContextFunc
+	fwd      netx.DialFunc
 	dnsCache *Resolver
 
 	mu          sync.Mutex
@@ -660,7 +663,7 @@ func v6addrs(aa []netip.Addr) (ret []netip.Addr) {
 // TLSDialer is like Dialer but returns a func suitable for using with net/http.Transport.DialTLSContext.
 // It returns a *tls.Conn type on success.
 // On TLS cert validation failure, it can invoke a backup DNS resolution strategy.
-func TLSDialer(fwd DialContextFunc, dnsCache *Resolver, tlsConfigBase *tls.Config) DialContextFunc {
+func TLSDialer(fwd netx.DialFunc, dnsCache *Resolver, tlsConfigBase *tls.Config) netx.DialFunc {
 	tcpDialer := Dialer(fwd, dnsCache)
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
 		host, _, err := net.SplitHostPort(address)

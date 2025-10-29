@@ -64,10 +64,30 @@ func (c *Conn) removeDerpPeerRoute(peer key.NodePublic, regionID int, dc *derpht
 // addDerpPeerRoute adds a DERP route entry, noting that peer was seen
 // on DERP node derpID, at least on the connection identified by dc.
 // See issue 150 for details.
-func (c *Conn) addDerpPeerRoute(peer key.NodePublic, derpID int, dc *derphttp.Client) {
+func (c *Conn) addDerpPeerRoute(peer key.NodePublic, regionID int, dc *derphttp.Client) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	mak.Set(&c.derpRoute, peer, derpRoute{derpID, dc})
+	mak.Set(&c.derpRoute, peer, derpRoute{regionID, dc})
+}
+
+// fallbackDERPRegionForPeer returns the DERP region ID we might be able to use
+// to contact peer, learned from observing recent DERP traffic from them.
+//
+// This is used as a fallback when a peer receives a packet from a peer
+// over DERP but doesn't known that peer's home DERP or any UDP endpoints.
+// This is particularly useful for large one-way nodes (such as hello.ts.net)
+// that don't actively reach out to other nodes, so don't need to be told
+// the DERP home of peers. They can instead learn the DERP home upon getting the
+// first connection.
+//
+// This can also help nodes from a slow or misbehaving control plane.
+func (c *Conn) fallbackDERPRegionForPeer(peer key.NodePublic) (regionID int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if dr, ok := c.derpRoute[peer]; ok {
+		return dr.regionID
+	}
+	return 0
 }
 
 // activeDerp contains fields for an active DERP connection.
@@ -718,8 +738,11 @@ func (c *Conn) processDERPReadResult(dm derpReadResult, b []byte) (n int, ep *en
 		return 0, nil
 	}
 
-	ipp := netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(regionID))
-	if c.handleDiscoMessage(b[:n], ipp, dm.src, discoRXPathDERP) {
+	srcAddr := epAddr{ap: netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(regionID))}
+	pt, isGeneveEncap := packetLooksLike(b[:n])
+	if pt == packetLooksLikeDisco &&
+		!isGeneveEncap { // We should never receive Geneve-encapsulated disco over DERP.
+		c.handleDiscoMessage(b[:n], srcAddr, false, dm.src, discoRXPathDERP)
 		return 0, nil
 	}
 
@@ -733,9 +756,9 @@ func (c *Conn) processDERPReadResult(dm derpReadResult, b []byte) (n int, ep *en
 		return 0, nil
 	}
 
-	ep.noteRecvActivity(ipp, mono.Now())
+	ep.noteRecvActivity(srcAddr, mono.Now())
 	if stats := c.stats.Load(); stats != nil {
-		stats.UpdateRxPhysical(ep.nodeAddr, ipp, 1, dm.n)
+		stats.UpdateRxPhysical(ep.nodeAddr, srcAddr.ap, 1, dm.n)
 	}
 
 	c.metrics.inboundPacketsDERPTotal.Add(1)

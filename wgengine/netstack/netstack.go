@@ -28,6 +28,7 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip/network/ipv6"
 	"github.com/sagernet/gvisor/pkg/tcpip/stack"
 	"github.com/sagernet/gvisor/pkg/tcpip/transport/icmp"
+	"github.com/sagernet/gvisor/pkg/tcpip/transport/raw"
 	"github.com/sagernet/gvisor/pkg/tcpip/transport/tcp"
 	"github.com/sagernet/gvisor/pkg/tcpip/transport/udp"
 	"github.com/sagernet/gvisor/pkg/waiter"
@@ -37,6 +38,7 @@ import (
 	"github.com/sagernet/tailscale/net/dns"
 	"github.com/sagernet/tailscale/net/ipset"
 	"github.com/sagernet/tailscale/net/netaddr"
+	"github.com/sagernet/tailscale/net/netx"
 	"github.com/sagernet/tailscale/net/packet"
 	"github.com/sagernet/tailscale/net/tsaddr"
 	"github.com/sagernet/tailscale/net/tsdial"
@@ -208,7 +210,7 @@ type Impl struct {
 	// TCP connection to another host (e.g. in subnet router mode).
 	//
 	// This is currently only used in tests.
-	forwardDialFunc func(context.Context, string, string) (net.Conn, error)
+	forwardDialFunc netx.DialFunc
 
 	// forwardInFlightPerClientDropped is a metric that tracks how many
 	// in-flight TCP forward requests were dropped due to the per-client
@@ -309,6 +311,7 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 		return nil, errors.New("nil Dialer")
 	}
 	ipstack := stack.New(stack.Options{
+		RawFactory:         new(raw.EndpointFactory),
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4, icmp.NewProtocol6},
 	})
@@ -317,16 +320,24 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 	if tcpipErr != nil {
 		return nil, fmt.Errorf("could not enable TCP SACK: %v", tcpipErr)
 	}
-	if runtime.GOOS == "windows" {
-		// See https://github.com/tailscale/tailscale/issues/9707
-		// Windows w/RACK performs poorly. ACKs do not appear to be handled in a
-		// timely manner, leading to spurious retransmissions and a reduced
-		// congestion window.
-		tcpRecoveryOpt := tcpip.TCPRecovery(0)
-		tcpipErr = ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpRecoveryOpt)
-		if tcpipErr != nil {
-			return nil, fmt.Errorf("could not disable TCP RACK: %v", tcpipErr)
-		}
+	// See https://github.com/tailscale/tailscale/issues/9707
+	// gVisor's RACK performs poorly. ACKs do not appear to be handled in a
+	// timely manner, leading to spurious retransmissions and a reduced
+	// congestion window.
+	tcpRecoveryOpt := tcpip.TCPRecovery(0)
+	tcpipErr = ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpRecoveryOpt)
+	if tcpipErr != nil {
+		return nil, fmt.Errorf("could not disable TCP RACK: %v", tcpipErr)
+	}
+	// gVisor defaults to reno at the time of writing. We explicitly set reno
+	// congestion control in order to prevent unexpected changes. Netstack
+	// has an int overflow in sender congestion window arithmetic that is more
+	// prone to trigger with cubic congestion control.
+	// See https://github.com/google/gvisor/issues/11632
+	renoOpt := tcpip.CongestionControlOption("reno")
+	tcpipErr = ipstack.SetTransportProtocolOption(tcp.ProtocolNumber, &renoOpt)
+	if tcpipErr != nil {
+		return nil, fmt.Errorf("could not set reno congestion control: %v", tcpipErr)
 	}
 	err := setTCPBufSizes(ipstack)
 	if err != nil {
@@ -574,7 +585,11 @@ func (ns *Impl) Start(lb *ipnlocal.LocalBackend) error {
 	}
 	ns.lb = lb
 	tcpFwd := tcp.NewForwarder(ns.ipstack, tcpRXBufDefSize, maxInFlightConnectionAttempts(), ns.acceptTCP)
-	udpFwd := udp.NewForwarder(ns.ipstack, ns.acceptUDP)
+	// udpFwd := udp.NewForwarder(ns.ipstack, ns.acceptUDP)
+	udpFwd := udp.NewForwarder(ns.ipstack, func(request *udp.ForwarderRequest) (handled bool) {
+		ns.acceptUDP(request)
+		return true
+	})
 	ns.ipstack.SetTransportProtocolHandler(tcp.ProtocolNumber, ns.wrapTCPProtocolHandler(tcpFwd.HandlePacket))
 	ns.ipstack.SetTransportProtocolHandler(udp.ProtocolNumber, ns.wrapUDPProtocolHandler(udpFwd.HandlePacket))
 	go ns.inject()
@@ -630,9 +645,10 @@ var v4broadcast = netaddr.IPv4(255, 255, 255, 255)
 // address slice views.
 func (ns *Impl) UpdateNetstackIPs(nm *netmap.NetworkMap) {
 	var selfNode tailcfg.NodeView
+	var serviceAddrSet set.Set[netip.Addr]
 	if nm != nil {
 		vipServiceIPMap := nm.GetVIPServiceIPMap()
-		serviceAddrSet := set.Set[netip.Addr]{}
+		serviceAddrSet = make(set.Set[netip.Addr], len(vipServiceIPMap)*2)
 		for _, addrs := range vipServiceIPMap {
 			serviceAddrSet.AddSlice(addrs)
 		}
@@ -668,6 +684,11 @@ func (ns *Impl) UpdateNetstackIPs(nm *netmap.NetworkMap) {
 				newPfx[p] = true
 			}
 		}
+	}
+
+	for addr := range serviceAddrSet {
+		p := netip.PrefixFrom(addr, addr.BitLen())
+		newPfx[p] = true
 	}
 
 	pfxToAdd := make(map[netip.Prefix]bool)
@@ -779,27 +800,6 @@ func (ns *Impl) handleLocalPackets(p *packet.Parsed, t *tstun.Wrapper, gro *gro.
 				p.IPVersion, p.IPProto, p.Dst, p.Src)
 		}
 
-		// If this is a ping message, handle it and don't pass to
-		// netstack.
-		pingIP, handlePing := ns.shouldHandlePing(p)
-		if handlePing {
-			ns.logf("netstack: handling local 4via6 ping: dst=%v pingIP=%v", dst, pingIP)
-
-			var pong []byte // the reply to the ping, if our relayed ping works
-			if dst.Is4() {
-				h := p.ICMP4Header()
-				h.ToResponse()
-				pong = packet.Generate(&h, p.Payload())
-			} else if dst.Is6() {
-				h := p.ICMP6Header()
-				h.ToResponse()
-				pong = packet.Generate(&h, p.Payload())
-			}
-
-			go ns.userPing(pingIP, pong, userPingDirectionInbound)
-			return filter.DropSilently, gro
-		}
-
 		// Fall through to writing inbound so netstack handles the
 		// 4via6 via connection.
 
@@ -832,6 +832,27 @@ func (ns *Impl) DialContextTCP(ctx context.Context, ipp netip.AddrPort) (*gonet.
 	return gonet.DialContextTCP(ctx, ns.ipstack, remoteAddress, ipType)
 }
 
+// DialContextTCPWithBind creates a new gonet.TCPConn connected to the specified
+// remoteAddress with its local address bound to localAddr on an available port.
+func (ns *Impl) DialContextTCPWithBind(ctx context.Context, localAddr netip.Addr, remoteAddr netip.AddrPort) (*gonet.TCPConn, error) {
+	remoteAddress := tcpip.FullAddress{
+		NIC:  nicID,
+		Addr: tcpip.AddrFromSlice(remoteAddr.Addr().AsSlice()),
+		Port: remoteAddr.Port(),
+	}
+	localAddress := tcpip.FullAddress{
+		NIC:  nicID,
+		Addr: tcpip.AddrFromSlice(localAddr.AsSlice()),
+	}
+	var ipType tcpip.NetworkProtocolNumber
+	if remoteAddr.Addr().Is4() {
+		ipType = ipv4.ProtocolNumber
+	} else {
+		ipType = ipv6.ProtocolNumber
+	}
+	return gonet.DialTCPWithBind(ctx, ns.ipstack, localAddress, remoteAddress, ipType)
+}
+
 func (ns *Impl) DialContextUDP(ctx context.Context, ipp netip.AddrPort) (*gonet.UDPConn, error) {
 	remoteAddress := &tcpip.FullAddress{
 		NIC:  nicID,
@@ -846,6 +867,28 @@ func (ns *Impl) DialContextUDP(ctx context.Context, ipp netip.AddrPort) (*gonet.
 	}
 
 	return gonet.DialUDP(ns.ipstack, nil, remoteAddress, ipType)
+}
+
+// DialContextUDPWithBind creates a new gonet.UDPConn. Connected to remoteAddr.
+// With its local address bound to localAddr on an available port.
+func (ns *Impl) DialContextUDPWithBind(ctx context.Context, localAddr netip.Addr, remoteAddr netip.AddrPort) (*gonet.UDPConn, error) {
+	remoteAddress := &tcpip.FullAddress{
+		NIC:  nicID,
+		Addr: tcpip.AddrFromSlice(remoteAddr.Addr().AsSlice()),
+		Port: remoteAddr.Port(),
+	}
+	localAddress := &tcpip.FullAddress{
+		NIC:  nicID,
+		Addr: tcpip.AddrFromSlice(localAddr.AsSlice()),
+	}
+	var ipType tcpip.NetworkProtocolNumber
+	if remoteAddr.Addr().Is4() {
+		ipType = ipv4.ProtocolNumber
+	} else {
+		ipType = ipv6.ProtocolNumber
+	}
+
+	return gonet.DialUDP(ns.ipstack, localAddress, remoteAddress, ipType)
 }
 
 // getInjectInboundBuffsSizes returns packet memory and a sizes slice for usage
@@ -1014,12 +1057,18 @@ func (ns *Impl) shouldProcessInbound(p *packet.Parsed, t *tstun.Wrapper) bool {
 			return true
 		}
 	}
-	if ns.lb != nil && p.IPProto == ipproto.TCP && isService {
-		// An assumption holds for this to work: when tun mode is on for a service,
-		// its tcp and web are not set. This is enforced in b.setServeConfigLocked.
-		if ns.lb.ShouldInterceptVIPServiceTCPPort(p.Dst) {
+	if isService {
+		if p.IsEchoRequest() {
 			return true
 		}
+		if ns.lb != nil && p.IPProto == ipproto.TCP {
+			// An assumption holds for this to work: when tun mode is on for a service,
+			// its tcp and web are not set. This is enforced in b.setServeConfigLocked.
+			if ns.lb.ShouldInterceptVIPServiceTCPPort(p.Dst) {
+				return true
+			}
+		}
+		return false
 	}
 	if p.IPVersion == 6 && !isLocal && viaRange.Contains(dstIP) {
 		return ns.lb != nil && ns.lb.ShouldHandleViaIP(dstIP)
@@ -1112,26 +1161,6 @@ func (ns *Impl) injectInbound(p *packet.Parsed, t *tstun.Wrapper, gro *gro.GRO) 
 	if !ns.shouldProcessInbound(p, t) {
 		// Let the host network stack (if any) deal with it.
 		return filter.Accept, gro
-	}
-
-	destIP := p.Dst.Addr()
-
-	// If this is an echo request and we're a subnet router, handle pings
-	// ourselves instead of forwarding the packet on.
-	pingIP, handlePing := ns.shouldHandlePing(p)
-	if handlePing {
-		var pong []byte // the reply to the ping, if our relayed ping works
-		if destIP.Is4() {
-			h := p.ICMP4Header()
-			h.ToResponse()
-			pong = packet.Generate(&h, p.Payload())
-		} else if destIP.Is6() {
-			h := p.ICMP6Header()
-			h.ToResponse()
-			pong = packet.Generate(&h, p.Payload())
-		}
-		go ns.userPing(pingIP, pong, userPingDirectionOutbound)
-		return filter.DropSilently, gro
 	}
 
 	if debugPackets {
@@ -1369,6 +1398,13 @@ func (ns *Impl) acceptTCP(r *tcp.ForwarderRequest) {
 	}
 }
 
+// tcpCloser is an interface to abstract around various TCPConn types that
+// allow closing of the read and write streams independently of each other.
+type tcpCloser interface {
+	CloseRead() error
+	CloseWrite() error
+}
+
 func (ns *Impl) forwardTCP(getClient func(...tcpip.SettableSocketOption) *gonet.TCPConn, clientRemoteIP netip.Addr, wq *waiter.Queue, dialAddr netip.AddrPort) (handled bool) {
 	dialAddrStr := dialAddr.String()
 	if debugNetstack() {
@@ -1397,7 +1433,7 @@ func (ns *Impl) forwardTCP(getClient func(...tcpip.SettableSocketOption) *gonet.
 	}()
 
 	// Attempt to dial the outbound connection before we accept the inbound one.
-	var dialFunc func(context.Context, string, string) (net.Conn, error)
+	var dialFunc netx.DialFunc
 	if ns.forwardDialFunc != nil {
 		dialFunc = ns.forwardDialFunc
 	} else {
@@ -1435,18 +1471,48 @@ func (ns *Impl) forwardTCP(getClient func(...tcpip.SettableSocketOption) *gonet.
 	}
 	defer client.Close()
 
+	// As of 2025-07-03, backend is always either a net.TCPConn
+	// from stdDialer.DialContext (which has the requisite functions),
+	// or nil from hangDialer in tests (in which case we would have
+	// errored out by now), so this conversion should always succeed.
+	backendTCPCloser, backendIsTCPCloser := backend.(tcpCloser)
 	connClosed := make(chan error, 2)
 	go func() {
 		_, err := io.Copy(backend, client)
+		if err != nil {
+			err = fmt.Errorf("client -> backend: %w", err)
+		}
 		connClosed <- err
+		err = nil
+		if backendIsTCPCloser {
+			err = backendTCPCloser.CloseWrite()
+		}
+		err = errors.Join(err, client.CloseRead())
+		if err != nil {
+			ns.logf("client -> backend close connection: %v", err)
+		}
 	}()
 	go func() {
 		_, err := io.Copy(client, backend)
+		if err != nil {
+			err = fmt.Errorf("backend -> client: %w", err)
+		}
 		connClosed <- err
+		err = nil
+		if backendIsTCPCloser {
+			err = backendTCPCloser.CloseRead()
+		}
+		err = errors.Join(err, client.CloseWrite())
+		if err != nil {
+			ns.logf("backend -> client close connection: %v", err)
+		}
 	}()
-	err = <-connClosed
-	if err != nil {
-		ns.logf("proxy connection closed with error: %v", err)
+	// Wait for both ends of the connection to close.
+	for range 2 {
+		err = <-connClosed
+		if err != nil {
+			ns.logf("proxy connection closed with error: %v", err)
+		}
 	}
 	ns.logf("[v2] netstack: forwarder connection to %s closed", dialAddrStr)
 	return

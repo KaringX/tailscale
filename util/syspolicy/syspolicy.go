@@ -20,6 +20,7 @@ import (
 	"github.com/sagernet/tailscale/util/syspolicy/rsop"
 	"github.com/sagernet/tailscale/util/syspolicy/setting"
 	"github.com/sagernet/tailscale/util/syspolicy/source"
+	"github.com/sagernet/tailscale/util/testenv"
 )
 
 var (
@@ -46,13 +47,37 @@ func RegisterStore(name string, scope setting.PolicyScope, store source.Store) (
 }
 
 // MustRegisterStoreForTest is like [rsop.RegisterStoreForTest], but it fails the test if the store could not be registered.
-func MustRegisterStoreForTest(tb TB, name string, scope setting.PolicyScope, store source.Store) *rsop.StoreRegistration {
+func MustRegisterStoreForTest(tb testenv.TB, name string, scope setting.PolicyScope, store source.Store) *rsop.StoreRegistration {
 	tb.Helper()
 	reg, err := rsop.RegisterStoreForTest(tb, name, scope, store)
 	if err != nil {
 		tb.Fatalf("Failed to register policy store %q as a %v policy source: %v", name, scope, err)
 	}
 	return reg
+}
+
+// HasAnyOf returns whether at least one of the specified policy settings is configured,
+// or an error if no keys are provided or the check fails.
+func HasAnyOf(keys ...Key) (bool, error) {
+	if len(keys) == 0 {
+		return false, errors.New("at least one key must be specified")
+	}
+	policy, err := rsop.PolicyFor(setting.DefaultScope())
+	if err != nil {
+		return false, err
+	}
+	effective := policy.Get()
+	for _, k := range keys {
+		_, err := effective.GetErr(k)
+		if errors.Is(err, setting.ErrNotConfigured) || errors.Is(err, setting.ErrNoSuchKey) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 // GetString returns a string policy setting with the specified key,
@@ -87,6 +112,13 @@ func GetStringArray(key Key, defaultValue []string) ([]string, error) {
 // present or set to a different value, "user-decides" is the default.
 func GetPreferenceOption(name Key) (setting.PreferenceOption, error) {
 	return getCurrentPolicySettingValue(name, setting.ShowChoiceByPolicy)
+}
+
+// GetPreferenceOptionOrDefault is like [GetPreferenceOption], but allows
+// specifying a default value to return if the policy setting is not configured.
+// It can be used in situations where "user-decides" is not the default.
+func GetPreferenceOptionOrDefault(name Key, defaultValue setting.PreferenceOption) (setting.PreferenceOption, error) {
+	return getCurrentPolicySettingValue(name, defaultValue)
 }
 
 // GetVisibility loads a policy from the registry that can be managed

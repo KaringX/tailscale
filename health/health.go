@@ -88,34 +88,35 @@ type Tracker struct {
 	// sysErr maps subsystems to their current error (or nil if the subsystem is healthy)
 	// Deprecated: using Warnables should be preferred
 	sysErr   map[Subsystem]error
-	watchers set.HandleSet[func(*Warnable, *UnhealthyState)] // opt func to run if error state changes
+	watchers set.HandleSet[func(Change)] // opt func to run if error state changes
 	timer    tstime.TimerController
 
 	latestVersion   *tailcfg.ClientVersion // or nil
 	checkForUpdates bool
 	applyUpdates    opt.Bool
 
-	inMapPoll               bool
-	inMapPollSince          time.Time
-	lastMapPollEndedAt      time.Time
-	lastStreamedMapResponse time.Time
-	lastNoiseDial           time.Time
-	derpHomeRegion          int
-	derpHomeless            bool
-	derpRegionConnected     map[int]bool
-	derpRegionHealthProblem map[int]string
-	derpRegionLastFrame     map[int]time.Time
-	derpMap                 *tailcfg.DERPMap // last DERP map from control, could be nil if never received one
-	lastMapRequestHeard     time.Time        // time we got a 200 from control for a MapRequest
-	ipnState                string
-	ipnWantRunning          bool
-	ipnWantRunningLastTrue  time.Time // when ipnWantRunning last changed false -> true
-	anyInterfaceUp          opt.Bool  // empty means unknown (assume true)
-	controlHealth           []string
-	lastLoginErr            error
-	localLogConfigErr       error
-	tlsConnectionErrors     map[string]error // map[ServerName]error
-	metricHealthMessage     *metrics.MultiLabelMap[metricHealthMessageLabel]
+	inMapPoll                   bool
+	inMapPollSince              time.Time
+	lastMapPollEndedAt          time.Time
+	lastStreamedMapResponse     time.Time
+	lastNoiseDial               time.Time
+	derpHomeRegion              int
+	derpHomeless                bool
+	derpRegionConnected         map[int]bool
+	derpRegionHealthProblem     map[int]string
+	derpRegionLastFrame         map[int]time.Time
+	derpMap                     *tailcfg.DERPMap // last DERP map from control, could be nil if never received one
+	lastMapRequestHeard         time.Time        // time we got a 200 from control for a MapRequest
+	ipnState                    string
+	ipnWantRunning              bool
+	ipnWantRunningLastTrue      time.Time                                           // when ipnWantRunning last changed false -> true
+	anyInterfaceUp              opt.Bool                                            // empty means unknown (assume true)
+	lastNotifiedControlMessages map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage // latest control messages processed, kept for change detection
+	controlMessages             map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage // latest control messages received
+	lastLoginErr                error
+	localLogConfigErr           error
+	tlsConnectionErrors         map[string]error // map[ServerName]error
+	metricHealthMessage         *metrics.MultiLabelMap[metricHealthMessageLabel]
 }
 
 func (t *Tracker) now() time.Time {
@@ -207,13 +208,15 @@ func unregister(w *Warnable) {
 // the program.
 type WarnableCode string
 
-// A Warnable is something that we might want to warn the user about, or not. A Warnable is either
-// in an healthy or unhealth state. A Warnable is unhealthy if the Tracker knows about a WarningState
-// affecting the Warnable.
-// In most cases, Warnables are components of the backend (for instance, "DNS" or "Magicsock").
-// Warnables are similar to the Subsystem type previously used in this package, but they provide
-// a unique identifying code for each Warnable, along with more metadata that makes it easier for
-// a GUI to display the Warnable in a user-friendly way.
+// A Warnable is something that we might want to warn the user about, or not. A
+// Warnable is either in a healthy or unhealthy state. A Warnable is unhealthy if
+// the Tracker knows about a WarningState affecting the Warnable.
+//
+// In most cases, Warnables are components of the backend (for instance, "DNS"
+// or "Magicsock"). Warnables are similar to the Subsystem type previously used
+// in this package, but they provide a unique identifying code for each
+// Warnable, along with more metadata that makes it easier for a GUI to display
+// the Warnable in a user-friendly way.
 type Warnable struct {
 	// Code is a string that uniquely identifies this Warnable across the entire Tailscale backend,
 	// and can be mapped to a user-displayable localized string.
@@ -362,6 +365,18 @@ func (t *Tracker) SetMetricsRegistry(reg *usermetric.Registry) {
 	}))
 }
 
+// IsUnhealthy reports whether the current state is unhealthy because the given
+// warnable is set.
+func (t *Tracker) IsUnhealthy(w *Warnable) bool {
+	if t.nil() {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, exists := t.warnableVal[w]
+	return exists
+}
+
 // SetUnhealthy sets a warningState for the given Warnable with the provided Args, and should be
 // called when a Warnable becomes unhealthy, or its unhealthy status needs to be updated.
 // SetUnhealthy takes ownership of args. The args can be nil if no additional information is
@@ -397,12 +412,18 @@ func (t *Tracker) setUnhealthyLocked(w *Warnable, args Args) {
 	prevWs := t.warnableVal[w]
 	mak.Set(&t.warnableVal, w, ws)
 	if !ws.Equal(prevWs) {
+
+		change := Change{
+			WarnableChanged: true,
+			Warnable:        w,
+			UnhealthyState:  w.unhealthyState(ws),
+		}
 		for _, cb := range t.watchers {
 			// If the Warnable has been unhealthy for more than its TimeToVisible, the callback should be
 			// executed immediately. Otherwise, the callback should be enqueued to run once the Warnable
 			// becomes visible.
 			if w.IsVisible(ws, t.now) {
-				go cb(w, w.unhealthyState(ws))
+				cb(change)
 				continue
 			}
 
@@ -415,7 +436,7 @@ func (t *Tracker) setUnhealthyLocked(w *Warnable, args Args) {
 				// Check if the Warnable is still unhealthy, as it could have become healthy between the time
 				// the timer was set for and the time it was executed.
 				if t.warnableVal[w] != nil {
-					go cb(w, w.unhealthyState(ws))
+					cb(change)
 					delete(t.pendingVisibleTimers, w)
 				}
 			})
@@ -448,8 +469,23 @@ func (t *Tracker) setHealthyLocked(w *Warnable) {
 		delete(t.pendingVisibleTimers, w)
 	}
 
+	change := Change{
+		WarnableChanged: true,
+		Warnable:        w,
+	}
 	for _, cb := range t.watchers {
-		go cb(w, nil)
+		cb(change)
+	}
+}
+
+// notifyWatchersControlChangedLocked calls each watcher to signal that control
+// health messages have changed (and should be fetched via CurrentState).
+func (t *Tracker) notifyWatchersControlChangedLocked() {
+	change := Change{
+		ControlHealthChanged: true,
+	}
+	for _, cb := range t.watchers {
+		cb(change)
 	}
 }
 
@@ -476,13 +512,57 @@ func (t *Tracker) AppendWarnableDebugFlags(base []string) []string {
 	return ret
 }
 
-// RegisterWatcher adds a function that will be called whenever the health state of any Warnable changes.
-// If a Warnable becomes unhealthy or its unhealthy state is updated, the callback will be called with its
-// current Representation.
-// If a Warnable becomes healthy, the callback will be called with ws set to nil.
-// The provided callback function will be executed in its own goroutine. The returned function can be used
-// to unregister the callback.
-func (t *Tracker) RegisterWatcher(cb func(w *Warnable, r *UnhealthyState)) (unregister func()) {
+// Change is used to communicate a change to health. This could either be due to
+// a Warnable changing from health to unhealthy (or vice-versa), or because the
+// health messages received from the control-plane have changed.
+//
+// Exactly one *Changed field will be true.
+type Change struct {
+	// ControlHealthChanged indicates it was health messages from the
+	// control-plane server that changed.
+	ControlHealthChanged bool
+
+	// WarnableChanged indicates it was a client Warnable which changed state.
+	WarnableChanged bool
+	// Warnable is whose health changed, as indicated in UnhealthyState.
+	Warnable *Warnable
+	// UnhealthyState is set if the changed Warnable is now unhealthy, or nil
+	// if Warnable is now healthy.
+	UnhealthyState *UnhealthyState
+}
+
+// RegisterWatcher adds a function that will be called its own goroutine
+// whenever the health state of any client [Warnable] or control-plane health
+// messages changes. The returned function can be used to unregister the
+// callback.
+//
+// If a client [Warnable] becomes unhealthy or its unhealthy state is updated,
+// the callback will be called with WarnableChanged set to true and the Warnable
+// and its UnhealthyState:
+//
+//	go cb(Change{WarnableChanged: true, Warnable: w, UnhealthyState: us})
+//
+// If a Warnable becomes healthy, the callback will be called with
+// WarnableChanged set to true, the Warnable set, and UnhealthyState set to nil:
+//
+//	go cb(Change{WarnableChanged: true, Warnable: w, UnhealthyState: nil})
+//
+// If the health messages from the control-plane change, the callback will be
+// called with ControlHealthChanged set to true. Recipients can fetch the set of
+// control-plane health messages by calling [Tracker.CurrentState]:
+//
+//	go cb(Change{ControlHealthChanged: true})
+func (t *Tracker) RegisterWatcher(cb func(Change)) (unregister func()) {
+	return t.registerSyncWatcher(func(c Change) {
+		go cb(c)
+	})
+}
+
+// registerSyncWatcher adds a function that will be called whenever the health
+// state changes. The provided callback function will be executed synchronously.
+// Call RegisterWatcher to register any callbacks that won't return from
+// execution immediately.
+func (t *Tracker) registerSyncWatcher(cb func(c Change)) (unregister func()) {
 	if t.nil() {
 		return func() {}
 	}
@@ -490,7 +570,7 @@ func (t *Tracker) RegisterWatcher(cb func(w *Warnable, r *UnhealthyState)) (unre
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.watchers == nil {
-		t.watchers = set.HandleSet[func(*Warnable, *UnhealthyState)]{}
+		t.watchers = set.HandleSet[func(Change)]{}
 	}
 	handle := t.watchers.Add(cb)
 	if t.timer == nil {
@@ -637,13 +717,15 @@ func (t *Tracker) updateLegacyErrorWarnableLocked(key Subsystem, err error) {
 	}
 }
 
-func (t *Tracker) SetControlHealth(problems []string) {
+func (t *Tracker) SetControlHealth(problems map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage) {
 	if t.nil() {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.controlHealth = problems
+
+	t.controlMessages = problems
+
 	t.selfCheckLocked()
 }
 
@@ -939,11 +1021,11 @@ func (t *Tracker) OverallError() error {
 	return t.multiErrLocked()
 }
 
-// Strings() returns a string array containing the Text of all Warnings
-// currently known to the Tracker. These strings can be presented to the
-// user, although ideally you would use the Code property on each Warning
-// to show a localized version of them instead.
-// This function is here for legacy compatibility purposes and is deprecated.
+// Strings() returns a string array containing the Text of all Warnings and
+// ControlHealth messages currently known to the Tracker. These strings can be
+// presented to the user, although ideally you would use the Code property on
+// each Warning to show a localized version of them instead. This function is
+// here for legacy compatibility purposes and is deprecated.
 func (t *Tracker) Strings() []string {
 	if t.nil() {
 		return nil
@@ -969,6 +1051,24 @@ func (t *Tracker) stringsLocked() []string {
 			result = append(result, w.Text(ws.Args))
 		}
 	}
+
+	warnLen := len(result)
+	for _, c := range t.controlMessages {
+		var msg string
+		if c.Title != "" && c.Text != "" {
+			msg = c.Title + ": " + c.Text
+		} else if c.Title != "" {
+			msg = c.Title + "."
+		} else if c.Text != "" {
+			msg = c.Text
+		}
+		if c.PrimaryAction != nil {
+			msg = msg + " " + c.PrimaryAction.Label + ": " + c.PrimaryAction.URL
+		}
+		result = append(result, msg)
+	}
+	sort.Strings(result[warnLen:])
+
 	return result
 }
 
@@ -1149,14 +1249,10 @@ func (t *Tracker) updateBuiltinWarnablesLocked() {
 		t.setHealthyLocked(derpRegionErrorWarnable)
 	}
 
-	if len(t.controlHealth) > 0 {
-		for _, s := range t.controlHealth {
-			t.setUnhealthyLocked(controlHealthWarnable, Args{
-				ArgError: s,
-			})
-		}
-	} else {
-		t.setHealthyLocked(controlHealthWarnable)
+	// Check if control health messages have changed
+	if !maps.EqualFunc(t.lastNotifiedControlMessages, t.controlMessages, tailcfg.DisplayMessage.Equal) {
+		t.lastNotifiedControlMessages = t.controlMessages
+		t.notifyWatchersControlChangedLocked()
 	}
 
 	if err := envknob.ApplyDiskConfigError(); err != nil {

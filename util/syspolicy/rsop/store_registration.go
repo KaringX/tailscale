@@ -9,9 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sagernet/tailscale/util/syspolicy/internal"
 	"github.com/sagernet/tailscale/util/syspolicy/setting"
 	"github.com/sagernet/tailscale/util/syspolicy/source"
+	"github.com/sagernet/tailscale/util/testenv"
 )
 
 // ErrAlreadyConsumed is the error returned when [StoreRegistration.ReplaceStore]
@@ -33,7 +33,7 @@ func RegisterStore(name string, scope setting.PolicyScope, store source.Store) (
 
 // RegisterStoreForTest is like [RegisterStore], but unregisters the store when
 // tb and all its subtests complete.
-func RegisterStoreForTest(tb internal.TB, name string, scope setting.PolicyScope, store source.Store) (*StoreRegistration, error) {
+func RegisterStoreForTest(tb testenv.TB, name string, scope setting.PolicyScope, store source.Store) (*StoreRegistration, error) {
 	setForTest(tb, &policyReloadMinDelay, 10*time.Millisecond)
 	setForTest(tb, &policyReloadMaxDelay, 500*time.Millisecond)
 

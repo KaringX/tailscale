@@ -9,7 +9,6 @@ package logpolicy
 import (
 	"bufio"
 	"bytes"
-	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -40,6 +39,7 @@ import (
 	"github.com/sagernet/tailscale/net/netknob"
 	"github.com/sagernet/tailscale/net/netmon"
 	"github.com/sagernet/tailscale/net/netns"
+	"github.com/sagernet/tailscale/net/netx"
 	"github.com/sagernet/tailscale/net/tlsdial"
 	"github.com/sagernet/tailscale/net/tshttpproxy"
 	"github.com/sagernet/tailscale/paths"
@@ -223,6 +223,9 @@ func LogsDir(logf logger.Logf) string {
 		logf("logpolicy: using LocalAppData dir %v", dir)
 		return dir
 	case "linux":
+		if distro.Get() == distro.JetKVM {
+			return "/userdata/tailscale/var"
+		}
 		// STATE_DIRECTORY is set by systemd 240+ but we support older
 		// systems-d. For example, Ubuntu 18.04 (Bionic Beaver) is 237.
 		systemdStateDir := os.Getenv("STATE_DIRECTORY")
@@ -502,10 +505,23 @@ type Options struct {
 	// If nil, [TransportOptions.New] is used to construct a new client
 	// with that particular transport sending logs to the default logs server.
 	HTTPC *http.Client
+
+	// MaxBufferSize is the maximum size of the log buffer.
+	// This controls the amount of logs that can be temporarily stored
+	// before the logs can be successfully upload.
+	// If zero, a default buffer size is chosen.
+	MaxBufferSize int
+
+	// MaxUploadSize is the maximum size per upload.
+	// This should only be set by clients that have been authenticated
+	// with the logging service as having a higher upload limit.
+	// If zero, a default upload size is chosen.
+	MaxUploadSize int
 }
 
-// New returns a new log policy (a logger and its instance ID).
-func (opts Options) New() *Policy {
+// init initializes the log policy and returns a logtail.Config and the
+// Policy.
+func (opts Options) init(disableLogging bool) (*logtail.Config, *Policy) {
 	if hostinfo.IsNATLabGuestVM() {
 		// In NATLab Gokrazy instances, tailscaled comes up concurently with
 		// DHCP and the doesn't have DNS for a while. Wait for DHCP first.
@@ -602,10 +618,11 @@ func (opts Options) New() *Policy {
 	}
 
 	conf := logtail.Config{
-		Collection:   newc.Collection,
-		PrivateID:    newc.PrivateID,
-		Stderr:       logWriter{console},
-		CompressLogs: true,
+		Collection:    newc.Collection,
+		PrivateID:     newc.PrivateID,
+		Stderr:        logWriter{console},
+		CompressLogs:  true,
+		MaxUploadSize: opts.MaxUploadSize,
 	}
 	if opts.Collection == logtail.CollectionNode {
 		conf.MetricsDelta = clientmetric.EncodeLogTailMetricsDelta
@@ -613,23 +630,24 @@ func (opts Options) New() *Policy {
 		conf.IncludeProcSequence = true
 	}
 
-	if envknob.NoLogsNoSupport() || testenv.InTest() {
-		opts.Logf("You have disabled logging. Tailscale will not be able to provide support.")
-		conf.HTTPC = &http.Client{Transport: noopPretendSuccessTransport{}}
+	if disableLogging {
+		opts.Logf("Tailscale logging is disabled by sing-box. Tailscale will not be able to provide support.")
+		conf.HTTPC = &http.Client{Transport: NoopPretendSuccessTransport{}}
 	} else {
 		// Only attach an on-disk filch buffer if we are going to be sending logs.
 		// No reason to persist them locally just to drop them later.
-		attachFilchBuffer(&conf, opts.Dir, opts.CmdName, opts.Logf)
+		attachFilchBuffer(&conf, opts.Dir, opts.CmdName, opts.MaxBufferSize, opts.Logf)
 		conf.HTTPC = opts.HTTPC
 
+		logHost := logtail.DefaultHost
+		if val := getLogTarget(); val != "" {
+			opts.Logf("You have enabled a non-default log target. Doing without being told to by Tailscale staff or your network administrator will make getting support difficult.")
+			conf.BaseURL = val
+			u, _ := url.Parse(val)
+			logHost = u.Host
+		}
+
 		if conf.HTTPC == nil {
-			logHost := logtail.DefaultHost
-			if val := getLogTarget(); val != "" {
-				opts.Logf("You have enabled a non-default log target. Doing without being told to by Tailscale staff or your network administrator will make getting support difficult.")
-				conf.BaseURL = val
-				u, _ := url.Parse(val)
-				logHost = u.Host
-			}
 			conf.HTTPC = &http.Client{Transport: TransportOptions{
 				Host:   logHost,
 				NetMon: opts.NetMon,
@@ -665,19 +683,27 @@ func (opts Options) New() *Policy {
 		opts.Logf("%s", earlyErrBuf.Bytes())
 	}
 
-	return &Policy{
+	return &conf, &Policy{
 		Logtail:  lw,
 		PublicID: newc.PublicID,
 		Logf:     opts.Logf,
 	}
 }
 
+// New returns a new log policy (a logger and its instance ID).
+func (opts Options) New() *Policy {
+	disableLogging := envknob.NoLogsNoSupport() || testenv.InTest() || runtime.GOOS == "plan9"
+	_, policy := opts.init(disableLogging)
+	return policy
+}
+
 // attachFilchBuffer creates an on-disk ring buffer using filch and attaches
 // it to the logtail config. Note that this is optional; if no buffer is set,
 // logtail will use an in-memory buffer.
-func attachFilchBuffer(conf *logtail.Config, dir, cmdName string, logf logger.Logf) {
+func attachFilchBuffer(conf *logtail.Config, dir, cmdName string, maxFileSize int, logf logger.Logf) {
 	filchOptions := filch.Options{
 		ReplaceStderr: redirectStderrToLogPanics(),
+		MaxFileSize:   maxFileSize,
 	}
 	filchPrefix := filepath.Join(dir, cmdName)
 
@@ -754,7 +780,7 @@ func (p *Policy) Shutdown(ctx context.Context) error {
 //
 // The netMon parameter is optional. It should be specified in environments where
 // Tailscaled is manipulating the routing table.
-func MakeDialFunc(netMon *netmon.Monitor, logf logger.Logf) func(ctx context.Context, netw, addr string) (net.Conn, error) {
+func MakeDialFunc(netMon *netmon.Monitor, logf logger.Logf) netx.DialFunc {
 	if netMon == nil {
 		netMon = netmon.NewStatic()
 	}
@@ -799,7 +825,7 @@ func dialContext(ctx context.Context, netw, addr string, netMon *netmon.Monitor,
 	dnsCache := &dnscache.Resolver{
 		Forward:     dnscache.Get().Forward, // use default cache's forwarder
 		UseLastGood: true,
-		//LookupIPFallback: dnsfallback.MakeLookupFunc(logf, netMon),
+		// LookupIPFallback: dnsfallback.MakeLookupFunc(logf, netMon),
 	}
 	dialer := dnscache.Dialer(nd.DialContext, dnsCache)
 	c, err = dialer(ctx, netw, addr)
@@ -841,7 +867,7 @@ type TransportOptions struct {
 // to the given host name. See [DialContext] for details on how it works.
 func (opts TransportOptions) New() http.RoundTripper {
 	if testenv.InTest() {
-		return noopPretendSuccessTransport{}
+		return NoopPretendSuccessTransport{}
 	}
 	if opts.NetMon == nil {
 		opts.NetMon = netmon.NewStatic()
@@ -886,8 +912,7 @@ func (opts TransportOptions) New() http.RoundTripper {
 		tr.TLSNextProto = map[string]func(authority string, c *tls.Conn) http.RoundTripper{}
 	}
 
-	host := cmp.Or(opts.Host, logtail.DefaultHost)
-	tr.TLSClientConfig = tlsdial.Config(host, opts.Health, tr.TLSClientConfig)
+	tr.TLSClientConfig = tlsdial.Config(opts.Health, tr.TLSClientConfig)
 	// Force TLS 1.3 since we know log.tailscale.com supports it.
 	tr.TLSClientConfig.MinVersion = tls.VersionTLS13
 
@@ -902,9 +927,9 @@ func goVersion() string {
 	return v
 }
 
-type noopPretendSuccessTransport struct{}
+type NoopPretendSuccessTransport struct{}
 
-func (noopPretendSuccessTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+func (NoopPretendSuccessTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	io.Copy(io.Discard, req.Body)
 	req.Body.Close()
 	return &http.Response{

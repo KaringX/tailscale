@@ -11,10 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sagernet/tailscale/util/syspolicy/internal"
 	"github.com/sagernet/tailscale/util/syspolicy/internal/loggerx"
 	"github.com/sagernet/tailscale/util/syspolicy/setting"
 	"github.com/sagernet/tailscale/util/syspolicy/source"
+	"github.com/sagernet/tailscale/util/testenv"
 )
 
 // ErrPolicyClosed is returned by [Policy.Reload], [Policy.addSource],
@@ -448,7 +448,7 @@ func (p *Policy) Close() {
 	}
 }
 
-func setForTest[T any](tb internal.TB, target *T, newValue T) {
+func setForTest[T any](tb testenv.TB, target *T, newValue T) {
 	oldValue := *target
 	tb.Cleanup(func() { *target = oldValue })
 	*target = newValue

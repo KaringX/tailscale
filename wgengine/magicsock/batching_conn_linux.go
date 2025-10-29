@@ -19,6 +19,7 @@ import (
 
 	"github.com/sagernet/tailscale/hostinfo"
 	"github.com/sagernet/tailscale/net/neterror"
+	"github.com/sagernet/tailscale/net/packet"
 	"github.com/sagernet/tailscale/types/nettype"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -92,9 +93,14 @@ const (
 	maxIPv6PayloadLen = 1<<16 - 1 - 8
 )
 
-// coalesceMessages iterates msgs, coalescing them where possible while
-// maintaining datagram order. All msgs have their Addr field set to addr.
-func (c *linuxBatchingConn) coalesceMessages(addr *net.UDPAddr, buffs [][]byte, msgs []ipv6.Message) int {
+// coalesceMessages iterates 'buffs', setting and coalescing them in 'msgs'
+// where possible while maintaining datagram order.
+//
+// All msgs have their Addr field set to addr.
+//
+// All msgs[i].Buffers[0] are preceded by a Geneve header with vni.get() if
+// vni.isSet().
+func (c *linuxBatchingConn) coalesceMessages(addr *net.UDPAddr, vni virtualNetworkID, buffs [][]byte, msgs []ipv6.Message, offset int) int {
 	var (
 		base     = -1 // index of msg we are currently coalescing into
 		gsoSize  int  // segmentation size of msgs[base]
@@ -105,7 +111,18 @@ func (c *linuxBatchingConn) coalesceMessages(addr *net.UDPAddr, buffs [][]byte, 
 	if addr.IP.To4() == nil {
 		maxPayloadLen = maxIPv6PayloadLen
 	}
+	vniIsSet := vni.isSet()
+	var gh packet.GeneveHeader
+	if vniIsSet {
+		gh.Protocol = packet.GeneveProtocolWireGuard
+		gh.VNI = vni.get()
+	}
 	for i, buff := range buffs {
+		if vniIsSet {
+			gh.Encode(buffs[i])
+		} else {
+			buff = buff[offset:]
+		}
 		if i > 0 {
 			msgLen := len(buff)
 			baseLenBefore := len(msgs[base].Buffers[0])
@@ -162,29 +179,39 @@ func (c *linuxBatchingConn) putSendBatch(batch *sendBatch) {
 	c.sendBatchPool.Put(batch)
 }
 
-func (c *linuxBatchingConn) WriteBatchTo(buffs [][]byte, addr netip.AddrPort) error {
+func (c *linuxBatchingConn) WriteBatchTo(buffs [][]byte, addr epAddr, offset int) error {
 	batch := c.getSendBatch()
 	defer c.putSendBatch(batch)
-	if addr.Addr().Is6() {
-		as16 := addr.Addr().As16()
+	if addr.ap.Addr().Is6() {
+		as16 := addr.ap.Addr().As16()
 		copy(batch.ua.IP, as16[:])
 		batch.ua.IP = batch.ua.IP[:16]
 	} else {
-		as4 := addr.Addr().As4()
+		as4 := addr.ap.Addr().As4()
 		copy(batch.ua.IP, as4[:])
 		batch.ua.IP = batch.ua.IP[:4]
 	}
-	batch.ua.Port = int(addr.Port())
+	batch.ua.Port = int(addr.ap.Port())
 	var (
 		n       int
 		retried bool
 	)
 retry:
 	if c.txOffload.Load() {
-		n = c.coalesceMessages(batch.ua, buffs, batch.msgs)
+		n = c.coalesceMessages(batch.ua, addr.vni, buffs, batch.msgs, offset)
 	} else {
+		vniIsSet := addr.vni.isSet()
+		var gh packet.GeneveHeader
+		if vniIsSet {
+			gh.Protocol = packet.GeneveProtocolWireGuard
+			gh.VNI = addr.vni.get()
+			offset -= packet.GeneveFixedHeaderLength
+		}
 		for i := range buffs {
-			batch.msgs[i].Buffers[0] = buffs[i]
+			if vniIsSet {
+				gh.Encode(buffs[i])
+			}
+			batch.msgs[i].Buffers[0] = buffs[i][offset:]
 			batch.msgs[i].Addr = batch.ua
 			batch.msgs[i].OOB = batch.msgs[i].OOB[:0]
 		}

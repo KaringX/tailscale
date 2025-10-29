@@ -30,7 +30,7 @@ type Client struct {
 	logf        logger.Logf
 	nc          Conn
 	br          *bufio.Reader
-	meshKey     string
+	meshKey     key.DERPMesh
 	canAckPings bool
 	isProber    bool
 
@@ -56,7 +56,7 @@ func (f clientOptFunc) update(o *clientOpt) { f(o) }
 
 // clientOpt are the options passed to newClient.
 type clientOpt struct {
-	MeshKey     string
+	MeshKey     key.DERPMesh
 	ServerPub   key.NodePublic
 	CanAckPings bool
 	IsProber    bool
@@ -66,7 +66,7 @@ type clientOpt struct {
 // access to join the mesh.
 //
 // An empty key means to not use a mesh key.
-func MeshKey(key string) ClientOpt { return clientOptFunc(func(o *clientOpt) { o.MeshKey = key }) }
+func MeshKey(k key.DERPMesh) ClientOpt { return clientOptFunc(func(o *clientOpt) { o.MeshKey = k }) }
 
 // IsProber returns a ClientOpt to pass to the DERP server during connect to
 // declare that this client is a a prober.
@@ -165,7 +165,7 @@ type clientInfo struct {
 	// trusted clients.  It's required to subscribe to the
 	// connection list & forward packets. It's empty for regular
 	// users.
-	MeshKey string `json:"meshKey,omitempty"`
+	MeshKey key.DERPMesh `json:"meshKey,omitempty,omitzero"`
 
 	// Version is the DERP protocol version that the client was built with.
 	// See the ProtocolVersion const.
@@ -177,6 +177,17 @@ type clientInfo struct {
 
 	// IsProber is whether this client is a prober.
 	IsProber bool `json:",omitempty"`
+}
+
+// Equal reports if two clientInfo values are equal.
+func (c *clientInfo) Equal(other *clientInfo) bool {
+	if c == nil || other == nil {
+		return c == other
+	}
+	if c.Version != other.Version || c.CanAckPings != other.CanAckPings || c.IsProber != other.IsProber {
+		return false
+	}
+	return c.MeshKey.Equal(other.MeshKey)
 }
 
 func (c *Client) sendClientKey() error {

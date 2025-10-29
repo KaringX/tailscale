@@ -26,11 +26,42 @@ const (
 	ControlURL Key = "LoginURL"  // default ""; if blank, ipn uses ipn.DefaultControlURL.
 	LogTarget  Key = "LogTarget" // default ""; if blank logging uses logtail.DefaultHost.
 	Tailnet    Key = "Tailnet"   // default ""; if blank, no tailnet name is sent to the server.
+
+	// AlwaysOn is a boolean key that controls whether Tailscale
+	// should always remain in a connected state, and the user should
+	// not be able to disconnect at their discretion.
+	//
+	// Warning: This policy setting is experimental and may change or be removed in the future.
+	// It may also not be fully supported by all Tailscale clients until it is out of experimental status.
+	// See tailscale/corp#26247, tailscale/corp#26248 and tailscale/corp#26249 for more information.
+	AlwaysOn Key = "AlwaysOn.Enabled"
+
+	// AlwaysOnOverrideWithReason is a boolean key that alters the behavior
+	// of [AlwaysOn]. When true, the user is allowed to disconnect Tailscale
+	// by providing a reason. The reason is logged and sent to the control
+	// for auditing purposes. It has no effect when [AlwaysOn] is false.
+	AlwaysOnOverrideWithReason Key = "AlwaysOn.OverrideWithReason"
+
+	// ReconnectAfter is a string value formatted for use with time.ParseDuration()
+	// that defines the duration after which the client should automatically reconnect
+	// to the Tailscale network following a user-initiated disconnect.
+	// An empty string or a zero duration disables automatic reconnection.
+	ReconnectAfter Key = "ReconnectAfter"
+
 	// ExitNodeID is the exit node's node id. default ""; if blank, no exit node is forced.
 	// Exit node ID takes precedence over exit node IP.
 	// To find the node ID, go to /api.md#device.
 	ExitNodeID Key = "ExitNodeID"
 	ExitNodeIP Key = "ExitNodeIP" // default ""; if blank, no exit node is forced. Value is exit node IP.
+
+	// AllowExitNodeOverride is a boolean key that allows the user to override exit node policy settings
+	// and manually select an exit node. It does not allow disabling exit node usage entirely.
+	// It is typically used in conjunction with [ExitNodeID] set to "auto:any".
+	//
+	// Warning: This policy setting is experimental and may change, be renamed or removed in the future.
+	// It may also not be fully supported by all Tailscale clients until it is out of experimental status.
+	// See tailscale/corp#29969.
+	AllowExitNodeOverride Key = "ExitNode.AllowOverride"
 
 	// Keys with a string value that specifies an option: "always", "never", "user-decides".
 	// The default is "user-decides" unless otherwise stated. Enforcement of
@@ -41,6 +72,14 @@ const (
 	ExitNodeAllowLANAccess    Key = "ExitNodeAllowLANAccess"
 	EnableTailscaleDNS        Key = "UseTailscaleDNSSettings"
 	EnableTailscaleSubnets    Key = "UseTailscaleSubnets"
+
+	// EnableDNSRegistration is a string value that can be set to "always", "never"
+	// or "user-decides". It controls whether DNS registration and dynamic DNS
+	// updates are enabled for the Tailscale interface. For historical reasons
+	// and to maintain compatibility with existing setups, the default is "never".
+	// It is only used on Windows.
+	EnableDNSRegistration Key = "EnableDNSRegistration"
+
 	// CheckUpdates is the key to signal if the updater should periodically
 	// check for updates.
 	CheckUpdates Key = "CheckUpdates"
@@ -90,14 +129,18 @@ const (
 	LogSCMInteractions      Key = "LogSCMInteractions"
 	FlushDNSOnSessionUnlock Key = "FlushDNSOnSessionUnlock"
 
+	// EncryptState is a boolean setting that specifies whether to encrypt the
+	// tailscaled state file with a TPM device.
+	EncryptState Key = "EncryptState"
+
 	// PostureChecking indicates if posture checking is enabled and the client shall gather
 	// posture data.
 	// Key is a string value that specifies an option: "always", "never", "user-decides".
 	// The default is "user-decides" unless otherwise stated.
 	PostureChecking Key = "PostureChecking"
 	// DeviceSerialNumber is the serial number of the device that is running Tailscale.
-	// This is used on iOS/tvOS to allow IT administrators to manually give us a serial number via MDM.
-	// We are unable to programmatically get the serial number from IOKit due to sandboxing restrictions.
+	// This is used on Android, iOS and tvOS to allow IT administrators to manually give us a serial number via MDM.
+	// We are unable to programmatically get the serial number on mobile due to sandboxing restrictions.
 	DeviceSerialNumber Key = "DeviceSerialNumber"
 
 	// ManagedByOrganizationName indicates the name of the organization managing the Tailscale
@@ -139,11 +182,15 @@ const (
 var implicitDefinitions = []*setting.Definition{
 	// Device policy settings (can only be configured on a per-device basis):
 	setting.NewDefinition(AllowedSuggestedExitNodes, setting.DeviceSetting, setting.StringListValue),
+	setting.NewDefinition(AllowExitNodeOverride, setting.DeviceSetting, setting.BooleanValue),
+	setting.NewDefinition(AlwaysOn, setting.DeviceSetting, setting.BooleanValue),
+	setting.NewDefinition(AlwaysOnOverrideWithReason, setting.DeviceSetting, setting.BooleanValue),
 	setting.NewDefinition(ApplyUpdates, setting.DeviceSetting, setting.PreferenceOptionValue),
 	setting.NewDefinition(AuthKey, setting.DeviceSetting, setting.StringValue),
 	setting.NewDefinition(CheckUpdates, setting.DeviceSetting, setting.PreferenceOptionValue),
 	setting.NewDefinition(ControlURL, setting.DeviceSetting, setting.StringValue),
 	setting.NewDefinition(DeviceSerialNumber, setting.DeviceSetting, setting.StringValue),
+	setting.NewDefinition(EnableDNSRegistration, setting.DeviceSetting, setting.PreferenceOptionValue),
 	setting.NewDefinition(EnableIncomingConnections, setting.DeviceSetting, setting.PreferenceOptionValue),
 	setting.NewDefinition(EnableRunExitNode, setting.DeviceSetting, setting.PreferenceOptionValue),
 	setting.NewDefinition(EnableServerMode, setting.DeviceSetting, setting.PreferenceOptionValue),
@@ -153,11 +200,13 @@ var implicitDefinitions = []*setting.Definition{
 	setting.NewDefinition(ExitNodeID, setting.DeviceSetting, setting.StringValue),
 	setting.NewDefinition(ExitNodeIP, setting.DeviceSetting, setting.StringValue),
 	setting.NewDefinition(FlushDNSOnSessionUnlock, setting.DeviceSetting, setting.BooleanValue),
+	setting.NewDefinition(EncryptState, setting.DeviceSetting, setting.BooleanValue),
 	setting.NewDefinition(Hostname, setting.DeviceSetting, setting.StringValue),
 	setting.NewDefinition(LogSCMInteractions, setting.DeviceSetting, setting.BooleanValue),
 	setting.NewDefinition(LogTarget, setting.DeviceSetting, setting.StringValue),
 	setting.NewDefinition(MachineCertificateSubject, setting.DeviceSetting, setting.StringValue),
 	setting.NewDefinition(PostureChecking, setting.DeviceSetting, setting.PreferenceOptionValue),
+	setting.NewDefinition(ReconnectAfter, setting.DeviceSetting, setting.DurationValue),
 	setting.NewDefinition(Tailnet, setting.DeviceSetting, setting.StringValue),
 
 	// User policy settings (can be configured on a user- or device-basis):
@@ -214,7 +263,7 @@ func WellKnownSettingDefinition(k Key) (*setting.Definition, error) {
 
 // RegisterWellKnownSettingsForTest registers all implicit setting definitions
 // for the duration of the test.
-func RegisterWellKnownSettingsForTest(tb TB) {
+func RegisterWellKnownSettingsForTest(tb testenv.TB) {
 	tb.Helper()
 	err := setting.SetDefinitionsForTest(tb, implicitDefinitions...)
 	if err != nil {

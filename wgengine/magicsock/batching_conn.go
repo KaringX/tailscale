@@ -4,8 +4,6 @@
 package magicsock
 
 import (
-	"net/netip"
-
 	"github.com/sagernet/tailscale/types/nettype"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -19,5 +17,5 @@ var _ ipv6.Message = ipv4.Message{}
 type batchingConn interface {
 	nettype.PacketConn
 	ReadBatch(msgs []ipv6.Message, flags int) (n int, err error)
-	WriteBatchTo(buffs [][]byte, addr netip.AddrPort) error
+	WriteBatchTo(buffs [][]byte, addr epAddr, offset int) error
 }

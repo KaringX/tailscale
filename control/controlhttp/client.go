@@ -43,6 +43,7 @@ import (
 	"github.com/sagernet/tailscale/health"
 	"github.com/sagernet/tailscale/net/dnscache"
 	"github.com/sagernet/tailscale/net/netutil"
+	"github.com/sagernet/tailscale/net/netx"
 	"github.com/sagernet/tailscale/net/sockstats"
 	"github.com/sagernet/tailscale/net/tlsdial"
 	"github.com/sagernet/tailscale/net/tshttpproxy"
@@ -95,6 +96,8 @@ func (a *Dialer) httpsFallbackDelay() time.Duration {
 var _ = envknob.RegisterBool("TS_USE_CONTROL_DIAL_PLAN") // to record at init time whether it's in use
 
 func (a *Dialer) dial(ctx context.Context) (*ClientConn, error) {
+	a.logPort80Failure.Store(true)
+
 	// If we don't have a dial plan, just fall back to dialing the single
 	// host we know about.
 	useDialPlan := envknob.BoolDefaultTrue("TS_USE_CONTROL_DIAL_PLAN")
@@ -245,6 +248,11 @@ func (a *Dialer) dial(ctx context.Context) (*ClientConn, error) {
 		results[i].conn = nil // so we don't close it in the defer
 		return conn, nil
 	}
+	if ctx.Err() != nil {
+		a.logf("controlhttp: context aborted dialing")
+		return nil, ctx.Err()
+	}
+
 	merr := multierr.New(errs...)
 
 	// If we get here, then we didn't get anywhere with our dial plan; fall back to just using DNS.
@@ -266,6 +274,15 @@ var forceNoise443 = envknob.RegisterBool("TS_FORCE_NOISE_443")
 // use HTTPS connections as its underlay connection (double crypto). This can
 // be necessary when networks or middle boxes are messing with port 80.
 func (d *Dialer) forceNoise443() bool {
+	if runtime.GOOS == "plan9" {
+		// For running demos of Plan 9 in a browser with network relays,
+		// we want to minimize the number of connections we're making.
+		// The main reason to use port 80 is to avoid double crypto
+		// costs server-side but the costs are tiny and number of Plan 9
+		// users doesn't make it worth it. Just disable this and always use
+		// HTTPS for Plan 9. That also reduces some log spam.
+		return true
+	}
 	if forceNoise443() {
 		return true
 	}
@@ -277,7 +294,9 @@ func (d *Dialer) forceNoise443() bool {
 		// This heuristic works around networks where port 80 is MITMed and
 		// appears to work for a bit post-Upgrade but then gets closed,
 		// such as seen in https://github.com/tailscale/tailscale/issues/13597.
-		d.logf("controlhttp: forcing port 443 dial due to recent noise dial")
+		if d.logPort80Failure.CompareAndSwap(true, false) {
+			d.logf("controlhttp: forcing port 443 dial due to recent noise dial")
+		}
 		return true
 	}
 
@@ -430,7 +449,7 @@ func (a *Dialer) resolver() *dnscache.Resolver {
 
 	return &dnscache.Resolver{
 		Forward: dnscache.Get().Forward,
-		//LookupIPFallback: dnsfallback.MakeLookupFunc(a.logf, a.NetMon),
+		// LookupIPFallback: dnsfallback.MakeLookupFunc(a.logf, a.NetMon),
 		UseLastGood: true,
 		Logf:        a.Logf, // not a.logf method; we want to propagate nil-ness
 	}
@@ -474,7 +493,7 @@ func (a *Dialer) tryURLUpgrade(ctx context.Context, u *url.URL, optAddr netip.Ad
 		dns = a.resolver()
 	}
 
-	var dialer dnscache.DialContextFunc
+	var dialer netx.DialFunc
 	if a.Dialer != nil {
 		dialer = a.Dialer
 	} else {
@@ -513,7 +532,7 @@ func (a *Dialer) tryURLUpgrade(ctx context.Context, u *url.URL, optAddr netip.Ad
 	// Disable HTTP2, since h2 can't do protocol switching.
 	tr.TLSClientConfig.NextProtos = []string{}
 	tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
-	tr.TLSClientConfig = tlsdial.Config(a.Hostname, a.HealthTracker, tr.TLSClientConfig)
+	tr.TLSClientConfig = tlsdial.Config(a.HealthTracker, tr.TLSClientConfig)
 	if !tr.TLSClientConfig.InsecureSkipVerify {
 		panic("unexpected") // should be set by tlsdial.Config
 	}

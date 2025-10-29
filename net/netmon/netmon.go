@@ -17,6 +17,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/util/clientmetric"
+	"github.com/sagernet/tailscale/util/eventbus"
 	"github.com/sagernet/tailscale/util/set"
 )
 
@@ -51,7 +52,10 @@ type osMon interface {
 
 // Monitor represents a monitoring instance.
 type Monitor struct {
-	logf   logger.Logf
+	logf    logger.Logf
+	b       *eventbus.Client
+	changed *eventbus.Publisher[*ChangeDelta]
+
 	om     osMon         // nil means not supported on this platform
 	change chan bool     // send false to wake poller, true to also force ChangeDeltas be sent
 	stop   chan struct{} // closed on Stop
@@ -116,22 +120,24 @@ type ChangeDelta struct {
 // New instantiates and starts a monitoring instance.
 // The returned monitor is inactive until it's started by the Start method.
 // Use RegisterChangeCallback to get notified of network changes.
-func New(logf logger.Logf, dialer N.Dialer) (*Monitor, error) {
+func New(bus *eventbus.Bus, logf logger.Logf, dialer N.Dialer) (*Monitor, error) {
 	logf = logger.WithPrefix(logf, "monitor: ")
 	m := &Monitor{
 		logf:     logf,
+		b:        bus.Client("netmon"),
 		change:   make(chan bool, 1),
 		stop:     make(chan struct{}),
 		lastWall: wallTime(),
 		dialer:   dialer,
 	}
+	m.changed = eventbus.Publish[*ChangeDelta](m.b)
 	st, err := m.interfaceStateUncached()
 	if err != nil {
 		return nil, err
 	}
 	m.ifState = st
 
-	m.om, err = newOSMon(logf, m)
+	m.om, err = newOSMon(bus, logf, m)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +170,7 @@ func (m *Monitor) InterfaceState() *State {
 }
 
 func (m *Monitor) interfaceStateUncached() (*State, error) {
-	return GetState()
+	return getState(m.tsIfName)
 }
 
 // SetTailscaleInterfaceName sets the name of the Tailscale interface. For
@@ -444,7 +450,6 @@ func (m *Monitor) handlePotentialChange(newState *State, forceCallbacks bool) {
 	delta.Major = m.IsMajorChangeFrom(oldState, newState)
 	if delta.Major {
 		m.gwValid = false
-		m.ifState = newState
 
 		if s1, s2 := oldState.String(), delta.New.String(); s1 == s2 {
 			m.logf("[unexpected] network state changed, but stringification didn't: %v", s1)
@@ -452,6 +457,7 @@ func (m *Monitor) handlePotentialChange(newState *State, forceCallbacks bool) {
 			m.logf("[unexpected] new: %s", jsonSummary(newState))
 		}
 	}
+	m.ifState = newState
 	// See if we have a queued or new time jump signal.
 	if timeJumped {
 		m.resetTimeJumpedLocked()
@@ -468,6 +474,7 @@ func (m *Monitor) handlePotentialChange(newState *State, forceCallbacks bool) {
 	if delta.TimeJumped {
 		metricChangeTimeJump.Add(1)
 	}
+	m.changed.Publish(delta)
 	for _, cb := range m.cbs {
 		go cb(delta)
 	}
@@ -599,7 +606,7 @@ func (m *Monitor) pollWallTime() {
 //
 // We don't do this on mobile platforms for battery reasons, and because these
 // platforms don't really sleep in the same way.
-const shouldMonitorTimeJump = runtime.GOOS != "android" && runtime.GOOS != "ios"
+const shouldMonitorTimeJump = runtime.GOOS != "android" && runtime.GOOS != "ios" && runtime.GOOS != "plan9"
 
 // checkWallTimeAdvanceLocked reports whether wall time jumped more than 150% of
 // pollWallTimeInterval, indicating we probably just came out of sleep. Once a

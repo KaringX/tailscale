@@ -64,10 +64,10 @@ var (
 		// fragmented, and we don't want to handle reassembly.
 		bpf.LoadAbsolute{Off: 6, Size: 2},
 		// More Fragments bit set means this is part of a fragmented packet.
-		bpf.JumpIf{Cond: bpf.JumpBitsSet, Val: 0x2000, SkipTrue: 7, SkipFalse: 0},
+		bpf.JumpIf{Cond: bpf.JumpBitsSet, Val: 0x2000, SkipTrue: 8, SkipFalse: 0},
 		// Non-zero fragment offset with MF=0 means this is the last
 		// fragment of packet.
-		bpf.JumpIf{Cond: bpf.JumpBitsSet, Val: 0x1fff, SkipTrue: 6, SkipFalse: 0},
+		bpf.JumpIf{Cond: bpf.JumpBitsSet, Val: 0x1fff, SkipTrue: 7, SkipFalse: 0},
 
 		// Load IP header length into X register.
 		bpf.LoadMemShift{Off: 0},
@@ -451,7 +451,13 @@ func (c *Conn) receiveDisco(pc *socket.Conn, isIPV6 bool) {
 			metricRecvDiscoPacketIPv4.Add(1)
 		}
 
-		c.handleDiscoMessage(payload, srcAddr, key.NodePublic{}, discoRXPathRawSocket)
+		pt, isGeneveEncap := packetLooksLike(payload)
+		if pt == packetLooksLikeDisco && !isGeneveEncap {
+			// The BPF program matching on disco does not currently support
+			// Geneve encapsulation. isGeneveEncap should not return true if
+			// payload is disco.
+			c.handleDiscoMessage(payload, epAddr{ap: srcAddr}, false, key.NodePublic{}, discoRXPathRawSocket)
+		}
 	}
 }
 

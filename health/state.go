@@ -5,6 +5,8 @@ package health
 
 import (
 	"time"
+
+	"github.com/sagernet/tailscale/tailcfg"
 )
 
 // State contains the health status of the backend, and is
@@ -21,16 +23,26 @@ type State struct {
 }
 
 // UnhealthyState contains information to be shown to the user to inform them
-// that a Warnable is currently unhealthy.
+// that a [Warnable] is currently unhealthy or [tailcfg.DisplayMessage] is being
+// sent from the control-plane.
 type UnhealthyState struct {
 	WarnableCode        WarnableCode
 	Severity            Severity
 	Title               string
 	Text                string
-	BrokenSince         *time.Time     `json:",omitempty"`
-	Args                Args           `json:",omitempty"`
-	DependsOn           []WarnableCode `json:",omitempty"`
-	ImpactsConnectivity bool           `json:",omitempty"`
+	BrokenSince         *time.Time            `json:",omitempty"`
+	Args                Args                  `json:",omitempty"`
+	DependsOn           []WarnableCode        `json:",omitempty"`
+	ImpactsConnectivity bool                  `json:",omitempty"`
+	PrimaryAction       *UnhealthyStateAction `json:",omitempty"`
+}
+
+// UnhealthyStateAction represents an action (URL and link) to be presented to
+// the user associated with an [UnhealthyState]. Analogous to
+// [tailcfg.DisplayMessageAction].
+type UnhealthyStateAction struct {
+	URL   string
+	Label string
 }
 
 // unhealthyState returns a unhealthyState of the Warnable given its current warningState.
@@ -98,8 +110,39 @@ func (t *Tracker) CurrentState() *State {
 		wm[w.Code] = *w.unhealthyState(ws)
 	}
 
+	for id, msg := range t.lastNotifiedControlMessages {
+		state := UnhealthyState{
+			WarnableCode:        WarnableCode("control-health." + id),
+			Severity:            severityFromTailcfg(msg.Severity),
+			Title:               msg.Title,
+			Text:                msg.Text,
+			ImpactsConnectivity: msg.ImpactsConnectivity,
+			// TODO(tailscale/corp#27759): DependsOn?
+		}
+
+		if msg.PrimaryAction != nil {
+			state.PrimaryAction = &UnhealthyStateAction{
+				URL:   msg.PrimaryAction.URL,
+				Label: msg.PrimaryAction.Label,
+			}
+		}
+
+		wm[state.WarnableCode] = state
+	}
+
 	return &State{
 		Warnings: wm,
+	}
+}
+
+func severityFromTailcfg(s tailcfg.DisplayMessageSeverity) Severity {
+	switch s {
+	case tailcfg.SeverityHigh:
+		return SeverityHigh
+	case tailcfg.SeverityLow:
+		return SeverityLow
+	default:
+		return SeverityMedium
 	}
 }
 

@@ -141,6 +141,9 @@ func (src *Hostinfo) Clone() *Hostinfo {
 	if dst.Location != nil {
 		dst.Location = ptr.To(*src.Location)
 	}
+	if dst.TPM != nil {
+		dst.TPM = ptr.To(*src.TPM)
+	}
 	return dst
 }
 
@@ -183,7 +186,10 @@ var _HostinfoCloneNeedsRegeneration = Hostinfo(struct {
 	UserspaceRouter opt.Bool
 	AppConnector    opt.Bool
 	ServicesHash    string
+	ExitNodeID      StableNodeID
 	Location        *Location
+	TPM             *TPMInfo
+	StateEncrypted  opt.Bool
 }{})
 
 // Clone makes a deep copy of NetInfo.
@@ -416,13 +422,14 @@ func (src *DERPRegion) Clone() *DERPRegion {
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _DERPRegionCloneNeedsRegeneration = DERPRegion(struct {
-	RegionID   int
-	RegionCode string
-	RegionName string
-	Latitude   float64
-	Longitude  float64
-	Avoid      bool
-	Nodes      []*DERPNode
+	RegionID        int
+	RegionCode      string
+	RegionName      string
+	Latitude        float64
+	Longitude       float64
+	Avoid           bool
+	NoMeasureNoHome bool
+	Nodes           []*DERPNode
 }{})
 
 // Clone makes a deep copy of DERPMap.
@@ -623,12 +630,30 @@ var _UserProfileCloneNeedsRegeneration = UserProfile(struct {
 	LoginName     string
 	DisplayName   string
 	ProfilePicURL string
-	Roles         emptyStructJSONSlice
+}{})
+
+// Clone makes a deep copy of VIPService.
+// The result aliases no memory with the original.
+func (src *VIPService) Clone() *VIPService {
+	if src == nil {
+		return nil
+	}
+	dst := new(VIPService)
+	*dst = *src
+	dst.Ports = append(src.Ports[:0:0], src.Ports...)
+	return dst
+}
+
+// A compilation failure here means this code must be regenerated, with the command at the top of this file.
+var _VIPServiceCloneNeedsRegeneration = VIPService(struct {
+	Name   ServiceName
+	Ports  []ProtoPortRange
+	Active bool
 }{})
 
 // Clone duplicates src into dst and reports whether it succeeded.
 // To succeed, <src, dst> must be of types <*T, *T> or <*T, **T>,
-// where T is one of User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,RegisterResponseAuth,RegisterRequest,DERPHomeParams,DERPRegion,DERPMap,DERPNode,SSHRule,SSHAction,SSHPrincipal,ControlDialPlan,Location,UserProfile.
+// where T is one of User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,RegisterResponseAuth,RegisterRequest,DERPHomeParams,DERPRegion,DERPMap,DERPNode,SSHRule,SSHAction,SSHPrincipal,ControlDialPlan,Location,UserProfile,VIPService.
 func Clone(dst, src any) bool {
 	switch src := src.(type) {
 	case *User:
@@ -799,6 +824,15 @@ func Clone(dst, src any) bool {
 			*dst = *src.Clone()
 			return true
 		case **UserProfile:
+			*dst = src.Clone()
+			return true
+		}
+	case *VIPService:
+		switch dst := dst.(type) {
+		case *VIPService:
+			*dst = *src.Clone()
+			return true
+		case **VIPService:
 			*dst = src.Clone()
 			return true
 		}

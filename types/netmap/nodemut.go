@@ -37,7 +37,7 @@ func (m NodeMutationDERPHome) Apply(n *tailcfg.Node) {
 	n.HomeDERP = m.DERPRegion
 }
 
-// NodeMutation is a NodeMutation that says a node's endpoints have changed.
+// NodeMutationEndpoints is a NodeMutation that says a node's endpoints have changed.
 type NodeMutationEndpoints struct {
 	mutatingNodeID
 	Endpoints []netip.AddrPort
@@ -163,6 +163,7 @@ func mapResponseContainsNonPatchFields(res *tailcfg.MapResponse) bool {
 		res.PacketFilters != nil ||
 		res.UserProfiles != nil ||
 		res.Health != nil ||
+		res.DisplayMessages != nil ||
 		res.SSHPolicy != nil ||
 		res.TKAInfo != nil ||
 		res.DomainDataPlaneAuditLogID != "" ||
@@ -176,6 +177,5 @@ func mapResponseContainsNonPatchFields(res *tailcfg.MapResponse) bool {
 		// function is called, so it should never be set anyway. But for
 		// completedness, and for tests, check it too:
 		res.PeersChanged != nil ||
-		res.DefaultAutoUpdate != "" ||
-		res.MaxKeyDuration > 0
+		res.DefaultAutoUpdate != ""
 }

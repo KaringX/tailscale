@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build linux || (darwin && !ios) || freebsd || openbsd
+//go:build (linux && !android) || (darwin && !ios) || freebsd || openbsd || plan9
 
 package ipnlocal
 
@@ -27,8 +27,8 @@ import (
 	"github.com/sagernet/tailscale/tailcfg"
 	"github.com/sagernet/tailscale/util/lineiter"
 	"github.com/sagernet/tailscale/util/mak"
-	"github.com/tailscale/golang-x-crypto/ssh"
 	"go4.org/mem"
+	"golang.org/x/crypto/ssh"
 )
 
 // keyTypes are the SSH key types that we either try to read from the

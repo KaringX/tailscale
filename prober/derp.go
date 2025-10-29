@@ -26,7 +26,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/sagernet/tailscale/client/tailscale"
+	"github.com/sagernet/tailscale/client/local"
 	"github.com/sagernet/tailscale/derp"
 	"github.com/sagernet/tailscale/derp/derphttp"
 	"github.com/sagernet/tailscale/net/netmon"
@@ -36,9 +36,9 @@ import (
 	"github.com/sagernet/tailscale/tailcfg"
 	"github.com/sagernet/tailscale/types/key"
 	"github.com/sagernet/tailscale/types/logger"
+	"github.com/sagernet/wireguard-go/tun"
 	wgconn "github.com/tailscale/wireguard-go/conn"
 	"github.com/tailscale/wireguard-go/device"
-	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/netipx"
 )
 
@@ -47,6 +47,7 @@ import (
 type derpProber struct {
 	p            *Prober
 	derpMapURL   string // or "local"
+	meshKey      key.DERPMesh
 	udpInterval  time.Duration
 	meshInterval time.Duration
 	tlsInterval  time.Duration
@@ -71,7 +72,7 @@ type derpProber struct {
 	udpProbeFn  func(string, int) ProbeClass
 	meshProbeFn func(string, string) ProbeClass
 	bwProbeFn   func(string, string, int64) ProbeClass
-	qdProbeFn   func(string, string, int, time.Duration) ProbeClass
+	qdProbeFn   func(string, string, int, time.Duration, key.DERPMesh) ProbeClass
 
 	sync.Mutex
 	lastDERPMap   *tailcfg.DERPMap
@@ -140,6 +141,12 @@ func WithTLSProbing(interval time.Duration) DERPOpt {
 func WithRegionCodeOrID(regionCode string) DERPOpt {
 	return func(d *derpProber) {
 		d.regionCodeOrID = regionCode
+	}
+}
+
+func WithMeshKey(meshKey key.DERPMesh) DERPOpt {
+	return func(d *derpProber) {
+		d.meshKey = meshKey
 	}
 }
 
@@ -250,7 +257,7 @@ func (d *derpProber) probeMapFn(ctx context.Context) error {
 					wantProbes[n] = true
 					if d.probes[n] == nil {
 						log.Printf("adding DERP queuing delay probe for %s->%s (%s)", server.Name, to.Name, region.RegionName)
-						d.probes[n] = d.p.Run(n, -10*time.Second, labels, d.qdProbeFn(server.Name, to.Name, d.qdPacketsPerSecond, d.qdPacketTimeout))
+						d.probes[n] = d.p.Run(n, -10*time.Second, labels, d.qdProbeFn(server.Name, to.Name, d.qdPacketsPerSecond, d.qdPacketTimeout, d.meshKey))
 					}
 				}
 			}
@@ -284,7 +291,7 @@ func (d *derpProber) probeMesh(from, to string) ProbeClass {
 			}
 
 			dm := d.lastDERPMap
-			return derpProbeNodePair(ctx, dm, fromN, toN)
+			return derpProbeNodePair(ctx, dm, fromN, toN, d.meshKey)
 		},
 		Class:  "derp_mesh",
 		Labels: Labels{"derp_path": derpPath},
@@ -308,7 +315,7 @@ func (d *derpProber) probeBandwidth(from, to string, size int64) ProbeClass {
 			if err != nil {
 				return err
 			}
-			return derpProbeBandwidth(ctx, d.lastDERPMap, fromN, toN, size, &transferTimeSeconds, &totalBytesTransferred, d.bwTUNIPv4Prefix)
+			return derpProbeBandwidth(ctx, d.lastDERPMap, fromN, toN, size, &transferTimeSeconds, &totalBytesTransferred, d.bwTUNIPv4Prefix, d.meshKey)
 		},
 		Class: "derp_bw",
 		Labels: Labels{
@@ -336,7 +343,7 @@ func (d *derpProber) probeBandwidth(from, to string, size int64) ProbeClass {
 // to the queuing delay measurement and are recorded as dropped. 'from' and 'to' are
 // expected to be names (DERPNode.Name) of two DERP servers in the same region,
 // and may refer to the same server.
-func (d *derpProber) probeQueuingDelay(from, to string, packetsPerSecond int, packetTimeout time.Duration) ProbeClass {
+func (d *derpProber) probeQueuingDelay(from, to string, packetsPerSecond int, packetTimeout time.Duration, meshKey key.DERPMesh) ProbeClass {
 	derpPath := "mesh"
 	if from == to {
 		derpPath = "single"
@@ -349,7 +356,7 @@ func (d *derpProber) probeQueuingDelay(from, to string, packetsPerSecond int, pa
 			if err != nil {
 				return err
 			}
-			return derpProbeQueuingDelay(ctx, d.lastDERPMap, fromN, toN, packetsPerSecond, packetTimeout, &packetsDropped, qdh)
+			return derpProbeQueuingDelay(ctx, d.lastDERPMap, fromN, toN, packetsPerSecond, packetTimeout, &packetsDropped, qdh, meshKey)
 		},
 		Class:  "derp_qd",
 		Labels: Labels{"derp_path": derpPath},
@@ -368,15 +375,15 @@ func (d *derpProber) probeQueuingDelay(from, to string, packetsPerSecond int, pa
 // derpProbeQueuingDelay continuously sends data between two local DERP clients
 // connected to two DERP servers in order to measure queuing delays. From and to
 // can be the same server.
-func derpProbeQueuingDelay(ctx context.Context, dm *tailcfg.DERPMap, from, to *tailcfg.DERPNode, packetsPerSecond int, packetTimeout time.Duration, packetsDropped *expvar.Float, qdh *histogram) (err error) {
+func derpProbeQueuingDelay(ctx context.Context, dm *tailcfg.DERPMap, from, to *tailcfg.DERPNode, packetsPerSecond int, packetTimeout time.Duration, packetsDropped *expvar.Float, qdh *histogram, meshKey key.DERPMesh) (err error) {
 	// This probe uses clients with isProber=false to avoid spamming the derper
 	// logs with every packet sent by the queuing delay probe.
-	fromc, err := newConn(ctx, dm, from, false)
+	fromc, err := newConn(ctx, dm, from, false, meshKey)
 	if err != nil {
 		return err
 	}
 	defer fromc.Close()
-	toc, err := newConn(ctx, dm, to, false)
+	toc, err := newConn(ctx, dm, to, false, meshKey)
 	if err != nil {
 		return err
 	}
@@ -418,6 +425,24 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 	txRecords := make([]txRecord, 0, packetsPerSecond*int(packetTimeout.Seconds()))
 	var txRecordsMu sync.Mutex
 
+	// applyTimeouts walks over txRecords and expires any records that are older
+	// than packetTimeout, recording in metrics that they were removed.
+	applyTimeouts := func() {
+		txRecordsMu.Lock()
+		defer txRecordsMu.Unlock()
+
+		now := time.Now()
+		recs := txRecords[:0]
+		for _, r := range txRecords {
+			if now.Sub(r.at) > packetTimeout {
+				packetsDropped.Add(1)
+			} else {
+				recs = append(recs, r)
+			}
+		}
+		txRecords = recs
+	}
+
 	// Send the packets.
 	sendErrC := make(chan error, 1)
 	// TODO: construct a disco CallMeMaybe in the same fashion as magicsock, e.g. magic bytes, src pub, seal payload.
@@ -438,10 +463,12 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				applyTimeouts()
 				txRecordsMu.Lock()
 				if len(txRecords) == cap(txRecords) {
 					txRecords = slices.Delete(txRecords, 0, 1)
 					packetsDropped.Add(1)
+					log.Printf("unexpected: overflow in txRecords")
 				}
 				txRecords = append(txRecords, txRecord{time.Now(), seq})
 				txRecordsMu.Unlock()
@@ -534,7 +561,7 @@ func (d *derpProber) getNodePair(n1, n2 string) (ret1, ret2 *tailcfg.DERPNode, _
 	return ret1, ret2, nil
 }
 
-var tsLocalClient tailscale.LocalClient
+var tsLocalClient local.Client
 
 // updateMap refreshes the locally-cached DERP map.
 func (d *derpProber) updateMap(ctx context.Context) error {
@@ -596,11 +623,23 @@ func (d *derpProber) updateMap(ctx context.Context) error {
 }
 
 func (d *derpProber) ProbeUDP(ipaddr string, port int) ProbeClass {
+	initLabels := make(Labels)
+	ip := net.ParseIP(ipaddr)
+
+	if ip.To4() != nil {
+		initLabels["address_family"] = "ipv4"
+	} else if ip.To16() != nil { // Will return an IPv4 as 16 byte, so ensure the check for IPv4 precedes this
+		initLabels["address_family"] = "ipv6"
+	} else {
+		initLabels["address_family"] = "unknown"
+	}
+
 	return ProbeClass{
 		Probe: func(ctx context.Context) error {
 			return derpProbeUDP(ctx, ipaddr, port)
 		},
-		Class: "derp_udp",
+		Class:  "derp_udp",
+		Labels: initLabels,
 	}
 }
 
@@ -662,15 +701,15 @@ func derpProbeUDP(ctx context.Context, ipStr string, port int) error {
 // DERP clients connected to two DERP servers.If tunIPv4Address is specified,
 // probes will use a TCP connection over a TUN device at this address in order
 // to exercise TCP-in-TCP in similar fashion to TCP over Tailscale via DERP.
-func derpProbeBandwidth(ctx context.Context, dm *tailcfg.DERPMap, from, to *tailcfg.DERPNode, size int64, transferTimeSeconds, totalBytesTransferred *expvar.Float, tunIPv4Prefix *netip.Prefix) (err error) {
+func derpProbeBandwidth(ctx context.Context, dm *tailcfg.DERPMap, from, to *tailcfg.DERPNode, size int64, transferTimeSeconds, totalBytesTransferred *expvar.Float, tunIPv4Prefix *netip.Prefix, meshKey key.DERPMesh) (err error) {
 	// This probe uses clients with isProber=false to avoid spamming the derper logs with every packet
 	// sent by the bandwidth probe.
-	fromc, err := newConn(ctx, dm, from, false)
+	fromc, err := newConn(ctx, dm, from, false, meshKey)
 	if err != nil {
 		return err
 	}
 	defer fromc.Close()
-	toc, err := newConn(ctx, dm, to, false)
+	toc, err := newConn(ctx, dm, to, false, meshKey)
 	if err != nil {
 		return err
 	}
@@ -700,13 +739,13 @@ func derpProbeBandwidth(ctx context.Context, dm *tailcfg.DERPMap, from, to *tail
 
 // derpProbeNodePair sends a small packet between two local DERP clients
 // connected to two DERP servers.
-func derpProbeNodePair(ctx context.Context, dm *tailcfg.DERPMap, from, to *tailcfg.DERPNode) (err error) {
-	fromc, err := newConn(ctx, dm, from, true)
+func derpProbeNodePair(ctx context.Context, dm *tailcfg.DERPMap, from, to *tailcfg.DERPNode, meshKey key.DERPMesh) (err error) {
+	fromc, err := newConn(ctx, dm, from, true, meshKey)
 	if err != nil {
 		return err
 	}
 	defer fromc.Close()
-	toc, err := newConn(ctx, dm, to, true)
+	toc, err := newConn(ctx, dm, to, true, meshKey)
 	if err != nil {
 		return err
 	}
@@ -1104,7 +1143,7 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds, totalBytesT
 	return nil
 }
 
-func newConn(ctx context.Context, dm *tailcfg.DERPMap, n *tailcfg.DERPNode, isProber bool) (*derphttp.Client, error) {
+func newConn(ctx context.Context, dm *tailcfg.DERPMap, n *tailcfg.DERPNode, isProber bool, meshKey key.DERPMesh) (*derphttp.Client, error) {
 	// To avoid spamming the log with regular connection messages.
 	l := logger.Filtered(log.Printf, func(s string) bool {
 		return !strings.Contains(s, "derphttp.Client.Connect: connecting to")
@@ -1120,6 +1159,7 @@ func newConn(ctx context.Context, dm *tailcfg.DERPMap, n *tailcfg.DERPNode, isPr
 		}
 	})
 	dc.IsProber = isProber
+	dc.MeshKey = meshKey
 	err := dc.Connect(ctx)
 	if err != nil {
 		return nil, err
@@ -1153,7 +1193,7 @@ func newConn(ctx context.Context, dm *tailcfg.DERPMap, n *tailcfg.DERPNode, isPr
 		case derp.ServerInfoMessage:
 			errc <- nil
 		default:
-			errc <- fmt.Errorf("unexpected first message type %T", errc)
+			errc <- fmt.Errorf("unexpected first message type %T", m)
 		}
 	}()
 	select {

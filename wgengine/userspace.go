@@ -24,6 +24,7 @@ import (
 	"github.com/sagernet/tailscale/health"
 	"github.com/sagernet/tailscale/ipn/ipnstate"
 	"github.com/sagernet/tailscale/net/dns"
+	"github.com/sagernet/tailscale/net/dns/resolver"
 	"github.com/sagernet/tailscale/net/flowtrack"
 	"github.com/sagernet/tailscale/net/ipset"
 	"github.com/sagernet/tailscale/net/netmon"
@@ -44,6 +45,7 @@ import (
 	"github.com/sagernet/tailscale/types/views"
 	"github.com/sagernet/tailscale/util/clientmetric"
 	"github.com/sagernet/tailscale/util/deephash"
+	"github.com/sagernet/tailscale/util/eventbus"
 	"github.com/sagernet/tailscale/util/mak"
 	"github.com/sagernet/tailscale/util/set"
 	"github.com/sagernet/tailscale/util/testenv"
@@ -93,6 +95,10 @@ type userspaceEngine struct {
 	workers    int
 	onReconfig ReconfigListener
 
+	// eventBus will eventually become required, but for now may be nil.
+	// TODO(creachadair): Enforce that this is non-nil at construction.
+	eventBus *eventbus.Bus
+
 	logf             logger.Logf
 	wgLogger         *wglog.Logger // a wireguard-go logging wrapper
 	reqCh            chan struct{}
@@ -101,6 +107,7 @@ type userspaceEngine struct {
 	tundev           *tstun.Wrapper
 	wgdev            *device.Device
 	router           router.Router
+	dialer           *tsdial.Dialer
 	confListenPort   uint16 // original conf.ListenPort
 	dns              *dns.Manager
 	magicConn        *magicsock.Conn
@@ -234,6 +241,13 @@ type Config struct {
 	// DriveForLocal, if populated, will cause the engine to expose a Taildrive
 	// listener at 100.100.100.100:8080.
 	DriveForLocal drive.FileSystemForLocal
+
+	// EventBus, if non-nil, is used for event publication and subscription by
+	// the Engine and its subsystems.
+	//
+	// TODO(creachadair): As of 2025-03-19 this is optional, but is intended to
+	// become required non-nil.
+	EventBus *eventbus.Bus
 }
 
 // NewFakeUserspaceEngine returns a new userspace engine for testing.
@@ -262,6 +276,8 @@ func NewFakeUserspaceEngine(logf logger.Logf, opts ...any) (Engine, error) {
 			conf.HealthTracker = v
 		case *usermetric.Registry:
 			conf.Metrics = v
+		case *eventbus.Bus:
+			conf.EventBus = v
 		default:
 			return nil, fmt.Errorf("unknown option type %T", v)
 		}
@@ -330,6 +346,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	}
 
 	e := &userspaceEngine{
+		eventBus:       conf.EventBus,
 		ctx:            conf.Context,
 		workers:        conf.Workers,
 		timeNow:        mono.Now,
@@ -338,6 +355,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		waitCh:         make(chan struct{}),
 		tundev:         tsTUNDev,
 		router:         rtr,
+		dialer:         conf.Dialer,
 		confListenPort: conf.ListenPort,
 		birdClient:     conf.BIRDClient,
 		controlKnobs:   conf.ControlKnobs,
@@ -357,7 +375,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	if conf.NetMon != nil {
 		e.netMon = conf.NetMon
 	} else {
-		mon, err := netmon.New(logf, nil)
+		mon, err := netmon.New(conf.EventBus, logf, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -398,6 +416,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		}
 	}
 	magicsockOpts := magicsock.Options{
+		EventBus:         e.eventBus,
 		Logf:             logf,
 		Port:             conf.ListenPort,
 		EndpointsFunc:    endpointsFn,
@@ -576,6 +595,17 @@ func (e *userspaceEngine) handleLocalPackets(p *packet.Parsed, t *tstun.Wrapper)
 			t.InjectInboundCopy(p.Buffer())
 			metricReflectToOS.Add(1)
 			return filter.Drop
+		}
+	}
+	if runtime.GOOS == "plan9" {
+		isLocalAddr, ok := e.isLocalAddr.LoadOk()
+		if ok {
+			if isLocalAddr(p.Dst.Addr()) {
+				// On Plan9's "tun" equivalent, everything goes back in and out
+				// the tun, even when the kernel's replying to itself.
+				t.InjectInboundCopy(p.Buffer())
+				return filter.Drop
+			}
 		}
 	}
 
@@ -1010,6 +1040,14 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 		if err != nil {
 			return err
 		}
+
+		if resolver.ShouldUseRoutes(e.controlKnobs) {
+			e.logf("wgengine: Reconfig: user dialer")
+			e.dialer.SetRoutes(routerCfg.Routes, routerCfg.LocalRoutes)
+		} else {
+			e.dialer.SetRoutes(nil, nil)
+		}
+
 		// Keep DNS configuration after router configuration, as some
 		// DNS managers refuse to apply settings if the device has no
 		// assigned address.
@@ -1275,7 +1313,6 @@ func (e *userspaceEngine) linkChange(delta *netmon.ChangeDelta) {
 }
 
 func (e *userspaceEngine) SetNetworkMap(nm *netmap.NetworkMap) {
-	e.magicConn.SetNetworkMap(nm)
 	e.mu.Lock()
 	e.netMap = nm
 	e.mu.Unlock()
@@ -1593,6 +1630,12 @@ type fwdDNSLinkSelector struct {
 }
 
 func (ls fwdDNSLinkSelector) PickLink(ip netip.Addr) (linkName string) {
+	// sandboxed macOS does not automatically bind to the loopback interface so
+	// we must be explicit about it.
+	if runtime.GOOS == "darwin" && ip.IsLoopback() {
+		return "lo0"
+	}
+
 	if ls.ue.isDNSIPOverTailscale.Load()(ip) {
 		return ls.tunName
 	}

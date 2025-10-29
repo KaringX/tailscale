@@ -32,6 +32,7 @@ import (
 	"github.com/sagernet/tailscale/net/tstun"
 	"github.com/sagernet/tailscale/proxymap"
 	"github.com/sagernet/tailscale/types/netmap"
+	"github.com/sagernet/tailscale/util/eventbus"
 	"github.com/sagernet/tailscale/util/usermetric"
 	"github.com/sagernet/tailscale/wgengine"
 	"github.com/sagernet/tailscale/wgengine/magicsock"
@@ -39,7 +40,12 @@ import (
 )
 
 // System contains all the subsystems of a Tailscale node (tailscaled, etc.)
+//
+// A valid System value must always have a non-nil Bus populated.  Callers must
+// ensure this before using the value further. Call [NewSystem] to obtain a
+// value ready to use.
 type System struct {
+	Bus            SubSystem[*eventbus.Bus]
 	Dialer         SubSystem[*tsdial.Dialer]
 	DNSManager     SubSystem[*dns.Manager] // can get its *resolver.Resolver from DNSManager.Resolver
 	Engine         SubSystem[wgengine.Engine]
@@ -70,6 +76,14 @@ type System struct {
 	userMetricsRegistry usermetric.Registry
 }
 
+// NewSystem constructs a new otherwise-empty [System] with a
+// freshly-constructed event bus populated.
+func NewSystem() *System {
+	sys := new(System)
+	sys.Set(eventbus.New())
+	return sys
+}
+
 // NetstackImpl is the interface that *netstack.Impl implements.
 // It's an interface for circular dependency reasons: netstack.Impl
 // references LocalBackend, and LocalBackend has a tsd.System.
@@ -82,6 +96,8 @@ type NetstackImpl interface {
 // has already been set.
 func (s *System) Set(v any) {
 	switch v := v.(type) {
+	case *eventbus.Bus:
+		s.Bus.Set(v)
 	case *netmon.Monitor:
 		s.NetMon.Set(v)
 	case *dns.Manager:

@@ -6,6 +6,7 @@ package logtail
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -14,9 +15,7 @@ import (
 	"log"
 	mrand "math/rand/v2"
 	"net/http"
-	"net/netip"
 	"os"
-	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -28,7 +27,6 @@ import (
 	"github.com/sagernet/tailscale/envknob"
 	"github.com/sagernet/tailscale/net/netmon"
 	"github.com/sagernet/tailscale/net/sockstats"
-	"github.com/sagernet/tailscale/net/tsaddr"
 	"github.com/sagernet/tailscale/tstime"
 	tslogger "github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/types/logid"
@@ -78,6 +76,7 @@ type Config struct {
 	StderrLevel    int             // max verbosity level to write to stderr; 0 means the non-verbose messages only
 	Buffer         Buffer          // temp storage, if nil a MemoryBuffer
 	CompressLogs   bool            // whether to compress the log uploads
+	MaxUploadSize  int             // maximum upload size; 0 means using the default
 
 	// MetricsDelta, if non-nil, is a func that returns an encoding
 	// delta in clientmetrics to upload alongside existing logs.
@@ -157,6 +156,7 @@ func NewLogger(cfg Config, logf tslogger.Logf) *Logger {
 		url:            cfg.BaseURL + "/c/" + cfg.Collection + "/" + cfg.PrivateID.String() + urlSuffix,
 		lowMem:         cfg.LowMemory,
 		buffer:         cfg.Buffer,
+		maxUploadSize:  cfg.MaxUploadSize,
 		skipClientTime: cfg.SkipClientTime,
 		drainWake:      make(chan struct{}, 1),
 		sentinel:       make(chan int32, 16),
@@ -192,6 +192,7 @@ type Logger struct {
 	skipClientTime bool
 	netMonitor     *netmon.Monitor
 	buffer         Buffer
+	maxUploadSize  int
 	drainWake      chan struct{}        // signal to speed up drain
 	drainBuf       []byte               // owned by drainPending for reuse
 	flushDelayFn   func() time.Duration // negative or zero return value to upload aggressively, or >0 to batch at this delay
@@ -325,7 +326,7 @@ func (l *Logger) drainPending() (b []byte) {
 		}
 	}()
 
-	maxLen := maxSize
+	maxLen := cmp.Or(l.maxUploadSize, maxSize)
 	if l.lowMem {
 		// When operating in a low memory environment, it is better to upload
 		// in multiple operations than it is to allocate a large body and OOM.
@@ -775,9 +776,10 @@ func (l *Logger) appendTextOrJSONLocked(dst, src []byte, level int) []byte {
 	// That's okay as the Tailscale log service limit is actually 2*maxSize.
 	// However, so long as logging applications aim to target the maxSize limit,
 	// there should be no trouble eventually uploading logs.
-	if len(src) > maxSize {
+	maxLen := cmp.Or(l.maxUploadSize, maxSize)
+	if len(src) > maxLen {
 		errDetail := fmt.Sprintf("entry too large: %d bytes", len(src))
-		errData := appendTruncatedString(nil, src, maxSize/len(`\uffff`)) // escaping could increase size
+		errData := appendTruncatedString(nil, src, maxLen/len(`\uffff`)) // escaping could increase size
 
 		dst = append(dst, '{')
 		dst = l.appendMetadata(dst, l.skipClientTime, true, l.procID, l.procSequence, errDetail, errData, level)
@@ -828,8 +830,6 @@ func (l *Logger) Logf(format string, args ...any) {
 	fmt.Fprintf(l, format, args...)
 }
 
-var obscureIPs = envknob.RegisterBool("TS_OBSCURE_LOGGED_IPS")
-
 // Write logs an encoded JSON blob.
 //
 // If the []byte passed to Write is not an encoded JSON blob,
@@ -854,50 +854,12 @@ func (l *Logger) Write(buf []byte) (int, error) {
 		}
 	}
 
-	if obscureIPs() {
-		buf = redactIPs(buf)
-	}
-
 	l.writeLock.Lock()
 	defer l.writeLock.Unlock()
 
 	b := l.appendTextOrJSONLocked(l.writeBuf[:0], buf, level)
 	_, err := l.sendLocked(b)
 	return inLen, err
-}
-
-var (
-	regexMatchesIPv6 = regexp.MustCompile(`([0-9a-fA-F]{1,4}):([0-9a-fA-F]{1,4}):([0-9a-fA-F:]{1,4})*`)
-	regexMatchesIPv4 = regexp.MustCompile(`(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}`)
-)
-
-// redactIPs is a helper function used in Write() to redact IPs (other than tailscale IPs).
-// This function takes a log line as a byte slice and
-// uses regex matching to parse and find IP addresses. Based on if the IP address is IPv4 or
-// IPv6, it parses and replaces the end of the addresses with an "x". This function returns the
-// log line with the IPs redacted.
-func redactIPs(buf []byte) []byte {
-	out := regexMatchesIPv6.ReplaceAllFunc(buf, func(b []byte) []byte {
-		ip, err := netip.ParseAddr(string(b))
-		if err != nil || tsaddr.IsTailscaleIP(ip) {
-			return b // don't change this one
-		}
-
-		prefix := bytes.Split(b, []byte(":"))
-		return bytes.Join(append(prefix[:2], []byte("x")), []byte(":"))
-	})
-
-	out = regexMatchesIPv4.ReplaceAllFunc(out, func(b []byte) []byte {
-		ip, err := netip.ParseAddr(string(b))
-		if err != nil || tsaddr.IsTailscaleIP(ip) {
-			return b // don't change this one
-		}
-
-		prefix := bytes.Split(b, []byte("."))
-		return bytes.Join(append(prefix[:2], []byte("x.x")), []byte("."))
-	})
-
-	return []byte(out)
 }
 
 var (

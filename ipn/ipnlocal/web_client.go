@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sagernet/tailscale/client/tailscale"
+	"github.com/sagernet/tailscale/client/local"
 	"github.com/sagernet/tailscale/client/web"
 	"github.com/sagernet/tailscale/logtail/backoff"
 	"github.com/sagernet/tailscale/net/netutil"
@@ -36,16 +36,16 @@ type webClient struct {
 
 	server *web.Server // or nil, initialized lazily
 
-	// lc optionally specifies a LocalClient to use to connect
+	// lc optionally specifies a local.Client to use to connect
 	// to the localapi for this tailscaled instance.
 	// If nil, a default is used.
-	lc *tailscale.LocalClient
+	lc *local.Client
 }
 
 // ConfigureWebClient configures b.web prior to use.
-// Specifially, it sets b.web.lc to the provided LocalClient.
+// Specifially, it sets b.web.lc to the provided local.Client.
 // If provided as nil, b.web.lc is cleared out.
-func (b *LocalBackend) ConfigureWebClient(lc *tailscale.LocalClient) {
+func (b *LocalBackend) ConfigureWebClient(lc *local.Client) {
 	b.webClient.mu.Lock()
 	defer b.webClient.mu.Unlock()
 	b.webClient.lc = lc
@@ -116,11 +116,12 @@ func (b *LocalBackend) handleWebClientConn(c net.Conn) error {
 // for each of the local device's Tailscale IP addresses. This is needed to properly
 // route local traffic when using kernel networking mode.
 func (b *LocalBackend) updateWebClientListenersLocked() {
-	if b.netMap == nil {
+	nm := b.currentNode().NetMap()
+	if nm == nil {
 		return
 	}
 
-	addrs := b.netMap.GetAddresses()
+	addrs := nm.GetAddresses()
 	for _, pfx := range addrs.All() {
 		addrPort := netip.AddrPortFrom(pfx.Addr(), webClientPort)
 		if _, ok := b.webClientListeners[addrPort]; ok {

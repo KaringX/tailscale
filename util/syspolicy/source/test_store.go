@@ -11,8 +11,8 @@ import (
 	"github.com/sagernet/tailscale/util/mak"
 	"github.com/sagernet/tailscale/util/set"
 	"github.com/sagernet/tailscale/util/slicesx"
-	"github.com/sagernet/tailscale/util/syspolicy/internal"
 	"github.com/sagernet/tailscale/util/syspolicy/setting"
+	"github.com/sagernet/tailscale/util/testenv"
 	xmaps "golang.org/x/exp/maps"
 )
 
@@ -79,7 +79,7 @@ func (r TestExpectedReads) operation() testReadOperation {
 
 // TestStore is a [Store] that can be used in tests.
 type TestStore struct {
-	tb internal.TB
+	tb testenv.TB
 
 	done chan struct{}
 
@@ -98,7 +98,7 @@ type TestStore struct {
 
 // NewTestStore returns a new [TestStore].
 // The tb will be used to report coding errors detected by the [TestStore].
-func NewTestStore(tb internal.TB) *TestStore {
+func NewTestStore(tb testenv.TB) *TestStore {
 	m := make(map[setting.Key]any)
 	store := &TestStore{
 		tb:   tb,
@@ -112,7 +112,7 @@ func NewTestStore(tb internal.TB) *TestStore {
 
 // NewTestStoreOf is a shorthand for [NewTestStore] followed by [TestStore.SetBooleans],
 // [TestStore.SetUInt64s], [TestStore.SetStrings] or [TestStore.SetStringLists].
-func NewTestStoreOf[T TestValueType](tb internal.TB, settings ...TestSetting[T]) *TestStore {
+func NewTestStoreOf[T TestValueType](tb testenv.TB, settings ...TestSetting[T]) *TestStore {
 	store := NewTestStore(tb)
 	switch settings := any(settings).(type) {
 	case []TestSetting[bool]:
@@ -152,6 +152,13 @@ func (s *TestStore) RegisterChangeCallback(callback func()) (unregister func(), 
 		defer s.mu.Unlock()
 		delete(s.cbs, handle)
 	}, nil
+}
+
+// IsEmpty reports whether the store does not contain any settings.
+func (s *TestStore) IsEmpty() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.mr) == 0
 }
 
 // ReadString implements [Store].

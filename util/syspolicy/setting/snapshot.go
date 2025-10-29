@@ -9,6 +9,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	jsonv2 "github.com/go-json-experiment/json"
 	"github.com/go-json-experiment/json/jsontext"
@@ -147,23 +148,46 @@ type snapshotJSON struct {
 	Settings map[Key]RawItem `json:",omitempty"`
 }
 
-// MarshalJSONV2 implements [jsonv2.MarshalerV2].
-func (s *Snapshot) MarshalJSONV2(out *jsontext.Encoder, opts jsonv2.Options) error {
+var (
+	_ jsonv2.MarshalerTo     = (*Snapshot)(nil)
+	_ jsonv2.UnmarshalerFrom = (*Snapshot)(nil)
+)
+
+// As of 2025-07-28, jsonv2 no longer has a default representation for [time.Duration],
+// so we need to provide a custom marshaler.
+//
+// This is temporary until the decision on the default representation is made
+// (see https://github.com/golang/go/issues/71631#issuecomment-2981670799).
+//
+// In the future, we might either use the default representation (if compatible with
+// [time.Duration.String]) or specify something like json.WithFormat[time.Duration]("units")
+// when golang/go#71664 is implemented.
+//
+// TODO(nickkhyl): revisit this when the decision on the default [time.Duration]
+// representation is made in golang/go#71631 and/or golang/go#71664 is implemented.
+var formatDurationAsUnits = jsonv2.JoinOptions(
+	jsonv2.WithMarshalers(jsonv2.MarshalToFunc(func(e *jsontext.Encoder, t time.Duration) error {
+		return e.WriteToken(jsontext.String(t.String()))
+	})),
+)
+
+// MarshalJSONTo implements [jsonv2.MarshalerTo].
+func (s *Snapshot) MarshalJSONTo(out *jsontext.Encoder) error {
 	data := &snapshotJSON{}
 	if s != nil {
 		data.Summary = s.summary
 		data.Settings = s.m
 	}
-	return jsonv2.MarshalEncode(out, data, opts)
+	return jsonv2.MarshalEncode(out, data, formatDurationAsUnits)
 }
 
-// UnmarshalJSONV2 implements [jsonv2.UnmarshalerV2].
-func (s *Snapshot) UnmarshalJSONV2(in *jsontext.Decoder, opts jsonv2.Options) error {
+// UnmarshalJSONFrom implements [jsonv2.UnmarshalerFrom].
+func (s *Snapshot) UnmarshalJSONFrom(in *jsontext.Decoder) error {
 	if s == nil {
 		return errors.New("s must not be nil")
 	}
 	data := &snapshotJSON{}
-	if err := jsonv2.UnmarshalDecode(in, data, opts); err != nil {
+	if err := jsonv2.UnmarshalDecode(in, data); err != nil {
 		return err
 	}
 	*s = Snapshot{m: data.Settings, sig: deephash.Hash(&data.Settings), summary: data.Summary}
@@ -172,12 +196,12 @@ func (s *Snapshot) UnmarshalJSONV2(in *jsontext.Decoder, opts jsonv2.Options) er
 
 // MarshalJSON implements [json.Marshaler].
 func (s *Snapshot) MarshalJSON() ([]byte, error) {
-	return jsonv2.Marshal(s) // uses MarshalJSONV2
+	return jsonv2.Marshal(s) // uses MarshalJSONTo
 }
 
 // UnmarshalJSON implements [json.Unmarshaler].
 func (s *Snapshot) UnmarshalJSON(b []byte) error {
-	return jsonv2.Unmarshal(b, s) // uses UnmarshalJSONV2
+	return jsonv2.Unmarshal(b, s) // uses UnmarshalJSONFrom
 }
 
 // MergeSnapshots returns a [Snapshot] that contains all [RawItem]s
