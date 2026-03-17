@@ -9,10 +9,12 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	jsonv2 "github.com/go-json-experiment/json"
 	"github.com/go-json-experiment/json/jsontext"
 	"github.com/sagernet/tailscale/util/deephash"
+	"github.com/sagernet/tailscale/util/syspolicy/pkey"
 	xmaps "golang.org/x/exp/maps"
 )
 
@@ -20,28 +22,28 @@ import (
 // a set of policy settings applied at a specific moment in time.
 // A nil pointer to [Snapshot] is valid.
 type Snapshot struct {
-	m       map[Key]RawItem
+	m       map[pkey.Key]RawItem
 	sig     deephash.Sum // of m
 	summary Summary
 }
 
 // NewSnapshot returns a new [Snapshot] with the specified items and options.
-func NewSnapshot(items map[Key]RawItem, opts ...SummaryOption) *Snapshot {
+func NewSnapshot(items map[pkey.Key]RawItem, opts ...SummaryOption) *Snapshot {
 	return &Snapshot{m: xmaps.Clone(items), sig: deephash.Hash(&items), summary: SummaryWith(opts...)}
 }
 
 // All returns an iterator over policy settings in s. The iteration order is not
 // specified and is not guaranteed to be the same from one call to the next.
-func (s *Snapshot) All() iter.Seq2[Key, RawItem] {
+func (s *Snapshot) All() iter.Seq2[pkey.Key, RawItem] {
 	if s == nil {
-		return func(yield func(Key, RawItem) bool) {}
+		return func(yield func(pkey.Key, RawItem) bool) {}
 	}
 	return maps.All(s.m)
 }
 
 // Get returns the value of the policy setting with the specified key
 // or nil if it is not configured or has an error.
-func (s *Snapshot) Get(k Key) any {
+func (s *Snapshot) Get(k pkey.Key) any {
 	v, _ := s.GetErr(k)
 	return v
 }
@@ -49,7 +51,7 @@ func (s *Snapshot) Get(k Key) any {
 // GetErr returns the value of the policy setting with the specified key,
 // [ErrNotConfigured] if it is not configured, or an error returned by
 // the policy Store if the policy setting could not be read.
-func (s *Snapshot) GetErr(k Key) (any, error) {
+func (s *Snapshot) GetErr(k pkey.Key) (any, error) {
 	if s != nil {
 		if s, ok := s.m[k]; ok {
 			return s.Value(), s.Error()
@@ -61,7 +63,7 @@ func (s *Snapshot) GetErr(k Key) (any, error) {
 // GetSetting returns the untyped policy setting with the specified key and true
 // if a policy setting with such key has been configured;
 // otherwise, it returns zero, false.
-func (s *Snapshot) GetSetting(k Key) (setting RawItem, ok bool) {
+func (s *Snapshot) GetSetting(k pkey.Key) (setting RawItem, ok bool) {
 	setting, ok = s.m[k]
 	return setting, ok
 }
@@ -93,9 +95,9 @@ func (s *Snapshot) EqualItems(s2 *Snapshot) bool {
 
 // Keys return an iterator over keys in s. The iteration order is not specified
 // and is not guaranteed to be the same from one call to the next.
-func (s *Snapshot) Keys() iter.Seq[Key] {
+func (s *Snapshot) Keys() iter.Seq[pkey.Key] {
 	if s.m == nil {
-		return func(yield func(Key) bool) {}
+		return func(yield func(pkey.Key) bool) {}
 	}
 	return maps.Keys(s.m)
 }
@@ -143,27 +145,50 @@ func (s *Snapshot) String() string {
 
 // snapshotJSON holds JSON-marshallable data for [Snapshot].
 type snapshotJSON struct {
-	Summary  Summary         `json:",omitzero"`
-	Settings map[Key]RawItem `json:",omitempty"`
+	Summary  Summary              `json:",omitzero"`
+	Settings map[pkey.Key]RawItem `json:",omitempty"`
 }
 
-// MarshalJSONV2 implements [jsonv2.MarshalerV2].
-func (s *Snapshot) MarshalJSONV2(out *jsontext.Encoder, opts jsonv2.Options) error {
+var (
+	_ jsonv2.MarshalerTo     = (*Snapshot)(nil)
+	_ jsonv2.UnmarshalerFrom = (*Snapshot)(nil)
+)
+
+// As of 2025-07-28, jsonv2 no longer has a default representation for [time.Duration],
+// so we need to provide a custom marshaler.
+//
+// This is temporary until the decision on the default representation is made
+// (see https://github.com/golang/go/issues/71631#issuecomment-2981670799).
+//
+// In the future, we might either use the default representation (if compatible with
+// [time.Duration.String]) or specify something like json.WithFormat[time.Duration]("units")
+// when golang/go#71664 is implemented.
+//
+// TODO(nickkhyl): revisit this when the decision on the default [time.Duration]
+// representation is made in golang/go#71631 and/or golang/go#71664 is implemented.
+var formatDurationAsUnits = jsonv2.JoinOptions(
+	jsonv2.WithMarshalers(jsonv2.MarshalToFunc(func(e *jsontext.Encoder, t time.Duration) error {
+		return e.WriteToken(jsontext.String(t.String()))
+	})),
+)
+
+// MarshalJSONTo implements [jsonv2.MarshalerTo].
+func (s *Snapshot) MarshalJSONTo(out *jsontext.Encoder) error {
 	data := &snapshotJSON{}
 	if s != nil {
 		data.Summary = s.summary
 		data.Settings = s.m
 	}
-	return jsonv2.MarshalEncode(out, data, opts)
+	return jsonv2.MarshalEncode(out, data, formatDurationAsUnits)
 }
 
-// UnmarshalJSONV2 implements [jsonv2.UnmarshalerV2].
-func (s *Snapshot) UnmarshalJSONV2(in *jsontext.Decoder, opts jsonv2.Options) error {
+// UnmarshalJSONFrom implements [jsonv2.UnmarshalerFrom].
+func (s *Snapshot) UnmarshalJSONFrom(in *jsontext.Decoder) error {
 	if s == nil {
 		return errors.New("s must not be nil")
 	}
 	data := &snapshotJSON{}
-	if err := jsonv2.UnmarshalDecode(in, data, opts); err != nil {
+	if err := jsonv2.UnmarshalDecode(in, data); err != nil {
 		return err
 	}
 	*s = Snapshot{m: data.Settings, sig: deephash.Hash(&data.Settings), summary: data.Summary}
@@ -172,12 +197,12 @@ func (s *Snapshot) UnmarshalJSONV2(in *jsontext.Decoder, opts jsonv2.Options) er
 
 // MarshalJSON implements [json.Marshaler].
 func (s *Snapshot) MarshalJSON() ([]byte, error) {
-	return jsonv2.Marshal(s) // uses MarshalJSONV2
+	return jsonv2.Marshal(s) // uses MarshalJSONTo
 }
 
 // UnmarshalJSON implements [json.Unmarshaler].
 func (s *Snapshot) UnmarshalJSON(b []byte) error {
-	return jsonv2.Unmarshal(b, s) // uses UnmarshalJSONV2
+	return jsonv2.Unmarshal(b, s) // uses UnmarshalJSONFrom
 }
 
 // MergeSnapshots returns a [Snapshot] that contains all [RawItem]s
@@ -208,7 +233,7 @@ func MergeSnapshots(snapshot1, snapshot2 *Snapshot) *Snapshot {
 		}
 		return &Snapshot{snapshot2.m, snapshot2.sig, SummaryWith(summaryOpts...)}
 	}
-	m := make(map[Key]RawItem, snapshot1.Len()+snapshot2.Len())
+	m := make(map[pkey.Key]RawItem, snapshot1.Len()+snapshot2.Len())
 	xmaps.Copy(m, snapshot1.m)
 	xmaps.Copy(m, snapshot2.m) // snapshot2 has higher precedence
 	return &Snapshot{m, deephash.Hash(&m), SummaryWith(summaryOpts...)}

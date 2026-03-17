@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/sagernet/tailscale/envknob"
+	"github.com/sagernet/tailscale/net/netx"
+	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/util/cloudenv"
 	"github.com/sagernet/tailscale/util/singleflight"
@@ -62,6 +64,10 @@ type Resolver struct {
 	// If nil, net.DefaultResolver is used.
 	Forward *net.Resolver
 
+	// LookupIPForTest, if non-nil and in tests, handles requests instead
+	// of the usual mechanisms.
+	LookupIPForTest func(ctx context.Context, host string) ([]netip.Addr, error)
+
 	// LookupIPFallback optionally provides a backup DNS mechanism
 	// to use if Forward returns an error or no results.
 	LookupIPFallback func(ctx context.Context, host string) ([]netip.Addr, error)
@@ -93,7 +99,7 @@ type Resolver struct {
 
 	sf singleflight.Group[string, ipRes]
 
-	mu      sync.Mutex
+	mu      syncs.Mutex
 	ipCache map[string]ipCacheEntry
 }
 
@@ -200,6 +206,9 @@ func (r *Resolver) LookupIP(ctx context.Context, host string) (ip, v6 netip.Addr
 				v6 = naIP
 			}
 			allIPs = append(allIPs, naIP)
+		}
+		if !ip.IsValid() && v6.IsValid() {
+			ip = v6
 		}
 		r.dlogf("returning %d static results", len(allIPs))
 		return
@@ -362,10 +371,8 @@ func (r *Resolver) addIPCache(host string, ip, ip6 netip.Addr, allIPs []netip.Ad
 	}
 }
 
-type DialContextFunc func(ctx context.Context, network, address string) (net.Conn, error)
-
 // Dialer returns a wrapped DialContext func that uses the provided dnsCache.
-func Dialer(fwd DialContextFunc, dnsCache *Resolver) DialContextFunc {
+func Dialer(fwd netx.DialFunc, dnsCache *Resolver) netx.DialFunc {
 	d := &dialer{
 		fwd:         fwd,
 		dnsCache:    dnsCache,
@@ -376,7 +383,7 @@ func Dialer(fwd DialContextFunc, dnsCache *Resolver) DialContextFunc {
 
 // dialer is the config and accumulated state for a dial func returned by Dialer.
 type dialer struct {
-	fwd      DialContextFunc
+	fwd      netx.DialFunc
 	dnsCache *Resolver
 
 	mu          sync.Mutex
@@ -468,7 +475,7 @@ type dialCall struct {
 	d                            *dialer
 	network, address, host, port string
 
-	mu    sync.Mutex           // lock ordering: dialer.mu, then dialCall.mu
+	mu    syncs.Mutex          // lock ordering: dialer.mu, then dialCall.mu
 	fails map[netip.Addr]error // set of IPs that failed to dial thus far
 }
 
@@ -660,7 +667,7 @@ func v6addrs(aa []netip.Addr) (ret []netip.Addr) {
 // TLSDialer is like Dialer but returns a func suitable for using with net/http.Transport.DialTLSContext.
 // It returns a *tls.Conn type on success.
 // On TLS cert validation failure, it can invoke a backup DNS resolution strategy.
-func TLSDialer(fwd DialContextFunc, dnsCache *Resolver, tlsConfigBase *tls.Config) DialContextFunc {
+func TLSDialer(fwd netx.DialFunc, dnsCache *Resolver, tlsConfigBase *tls.Config) netx.DialFunc {
 	tcpDialer := Dialer(fwd, dnsCache)
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
 		host, _, err := net.SplitHostPort(address)

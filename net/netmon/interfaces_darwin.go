@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"sync"
 	"syscall"
 	"unsafe"
 
+	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/util/mak"
 	"golang.org/x/net/route"
 	"golang.org/x/sys/unix"
@@ -26,7 +26,7 @@ func parseRoutingTable(rib []byte) ([]route.Message, error) {
 }
 
 var ifNames struct {
-	sync.Mutex
+	syncs.Mutex
 	m map[int]string // ifindex => name
 }
 

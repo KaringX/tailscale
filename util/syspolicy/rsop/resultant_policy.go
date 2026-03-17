@@ -7,14 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/sagernet/tailscale/util/syspolicy/internal"
+	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/util/syspolicy/internal/loggerx"
 	"github.com/sagernet/tailscale/util/syspolicy/setting"
 	"github.com/sagernet/tailscale/util/syspolicy/source"
+	"github.com/sagernet/tailscale/util/testenv"
 )
 
 // ErrPolicyClosed is returned by [Policy.Reload], [Policy.addSource],
@@ -57,7 +57,7 @@ type Policy struct {
 
 	changeCallbacks policyChangeCallbacks
 
-	mu             sync.Mutex
+	mu             syncs.Mutex
 	watcherStarted bool // whether [Policy.watchReload] was started
 	sources        source.ReadableSources
 	closing        bool // whether [Policy.Close] was called (even if we're still closing)
@@ -448,7 +448,7 @@ func (p *Policy) Close() {
 	}
 }
 
-func setForTest[T any](tb internal.TB, target *T, newValue T) {
+func setForTest[T any](tb testenv.TB, target *T, newValue T) {
 	oldValue := *target
 	tb.Cleanup(func() { *target = oldValue })
 	*target = newValue

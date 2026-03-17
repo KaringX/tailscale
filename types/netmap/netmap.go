@@ -26,14 +26,9 @@ import (
 // The fields should all be considered read-only. They might
 // alias parts of previous NetworkMap values.
 type NetworkMap struct {
-	SelfNode   tailcfg.NodeView
-	AllCaps    set.Set[tailcfg.NodeCapability] // set version of SelfNode.Capabilities + SelfNode.CapMap
-	NodeKey    key.NodePublic
-	PrivateKey key.NodePrivate
-	Expiry     time.Time
-	// Name is the DNS name assigned to this node.
-	// It is the MapResponse.Node.Name value and ends with a period.
-	Name string
+	SelfNode tailcfg.NodeView
+	AllCaps  set.Set[tailcfg.NodeCapability] // set version of SelfNode.Capabilities + SelfNode.CapMap
+	NodeKey  key.NodePublic
 
 	MachineKey key.MachinePublic
 
@@ -54,12 +49,12 @@ type NetworkMap struct {
 	// between updates and should not be modified.
 	DERPMap *tailcfg.DERPMap
 
-	// ControlHealth are the list of health check problems for this
+	// DisplayMessages are the list of health check problems for this
 	// node from the perspective of the control plane.
 	// If empty, there are no known problems from the control plane's
 	// point of view, but the node might know about its own health
 	// check problems.
-	ControlHealth []string
+	DisplayMessages map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage
 
 	// TKAEnabled indicates whether the tailnet key authority should be
 	// enabled, from the perspective of the control plane.
@@ -76,10 +71,9 @@ type NetworkMap struct {
 	// If this is empty, then data-plane audit logging is disabled.
 	DomainAuditLogID string
 
-	UserProfiles map[tailcfg.UserID]tailcfg.UserProfile
-
-	// MaxKeyDuration describes the MaxKeyDuration setting for the tailnet.
-	MaxKeyDuration time.Duration
+	// UserProfiles contains the profile information of UserIDs referenced
+	// in SelfNode and Peers.
+	UserProfiles map[tailcfg.UserID]tailcfg.UserProfileView
 }
 
 // User returns nm.SelfNode.User if nm.SelfNode is non-nil, otherwise it returns
@@ -115,7 +109,7 @@ func (nm *NetworkMap) GetVIPServiceIPMap() tailcfg.ServiceIPMappings {
 		return nil
 	}
 
-	ipMaps, err := tailcfg.UnmarshalNodeCapJSON[tailcfg.ServiceIPMappings](nm.SelfNode.CapMap().AsMap(), tailcfg.NodeAttrServiceHost)
+	ipMaps, err := tailcfg.UnmarshalNodeCapViewJSON[tailcfg.ServiceIPMappings](nm.SelfNode.CapMap(), tailcfg.NodeAttrServiceHost)
 	if len(ipMaps) != 1 || err != nil {
 		return nil
 	}
@@ -147,6 +141,14 @@ func (nm *NetworkMap) GetIPVIPServiceMap() IPServiceMappings {
 		}
 	}
 	return res
+}
+
+// SelfNodeOrZero returns the self node, or a zero value if nm is nil.
+func (nm *NetworkMap) SelfNodeOrZero() tailcfg.NodeView {
+	if nm == nil {
+		return tailcfg.NodeView{}
+	}
+	return nm.SelfNode
 }
 
 // AnyPeersAdvertiseRoutes reports whether any peer is advertising non-exit node routes.
@@ -229,10 +231,25 @@ func MagicDNSSuffixOfNodeName(nodeName string) string {
 //
 // It will neither start nor end with a period.
 func (nm *NetworkMap) MagicDNSSuffix() string {
-	if nm == nil {
+	return MagicDNSSuffixOfNodeName(nm.SelfName())
+}
+
+// SelfName returns nm.SelfNode.Name, or the empty string
+// if nm is nil or nm.SelfNode is invalid.
+func (nm *NetworkMap) SelfName() string {
+	if nm == nil || !nm.SelfNode.Valid() {
 		return ""
 	}
-	return MagicDNSSuffixOfNodeName(nm.Name)
+	return nm.SelfNode.Name()
+}
+
+// SelfKeyExpiry returns nm.SelfNode.KeyExpiry, or the zero
+// value if nil or nm.SelfNode is invalid.
+func (nm *NetworkMap) SelfKeyExpiry() time.Time {
+	if nm == nil || !nm.SelfNode.Valid() {
+		return time.Time{}
+	}
+	return nm.SelfNode.KeyExpiry()
 }
 
 // DomainName returns the name of the NetworkMap's
@@ -243,6 +260,22 @@ func (nm *NetworkMap) DomainName() string {
 		return ""
 	}
 	return nm.Domain
+}
+
+// TailnetDisplayName returns the admin-editable name contained in
+// NodeAttrTailnetDisplayName. If the capability is not present it
+// returns an empty string.
+func (nm *NetworkMap) TailnetDisplayName() string {
+	if nm == nil || !nm.SelfNode.Valid() {
+		return ""
+	}
+
+	tailnetDisplayNames, err := tailcfg.UnmarshalNodeCapViewJSON[string](nm.SelfNode.CapMap(), tailcfg.NodeAttrTailnetDisplayName)
+	if err != nil || len(tailnetDisplayNames) == 0 {
+		return ""
+	}
+
+	return tailnetDisplayNames[0]
 }
 
 // HasSelfCapability reports whether nm.SelfNode contains capability c.
@@ -289,7 +322,12 @@ func (nm *NetworkMap) PeerWithStableID(pid tailcfg.StableNodeID) (_ tailcfg.Node
 func (nm *NetworkMap) printConciseHeader(buf *strings.Builder) {
 	fmt.Fprintf(buf, "netmap: self: %v auth=%v",
 		nm.NodeKey.ShortString(), nm.GetMachineStatus())
-	login := nm.UserProfiles[nm.User()].LoginName
+
+	var login string
+	up, ok := nm.UserProfiles[nm.User()]
+	if ok {
+		login = up.LoginName()
+	}
 	if login == "" {
 		if nm.User().IsZero() {
 			login = "?"

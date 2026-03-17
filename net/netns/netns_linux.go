@@ -14,8 +14,8 @@ import (
 
 	"github.com/sagernet/tailscale/envknob"
 	"github.com/sagernet/tailscale/net/netmon"
+	"github.com/sagernet/tailscale/tsconst"
 	"github.com/sagernet/tailscale/types/logger"
-	"github.com/sagernet/tailscale/util/linuxfw"
 	"golang.org/x/sys/unix"
 )
 
@@ -111,7 +111,7 @@ func controlC(network, address string, c syscall.RawConn) error {
 }
 
 func setBypassMark(fd uintptr) error {
-	if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, linuxfw.TailscaleBypassMarkNum); err != nil {
+	if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, tsconst.LinuxBypassMarkNum); err != nil {
 		return fmt.Errorf("setting SO_MARK bypass: %w", err)
 	}
 	return nil

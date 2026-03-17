@@ -6,9 +6,9 @@ package magicsock
 import (
 	"net/netip"
 	"slices"
-	"sync"
 	"time"
 
+	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/tailcfg"
 	"github.com/sagernet/tailscale/tempfork/heap"
 	"github.com/sagernet/tailscale/util/mak"
@@ -107,7 +107,7 @@ func (eh endpointHeap) Min() *endpointTrackerEntry {
 //
 // See tailscale/tailscale#7877 for more information.
 type endpointTracker struct {
-	mu        sync.Mutex
+	mu        syncs.Mutex
 	endpoints map[netip.Addr]*endpointHeap
 }
 

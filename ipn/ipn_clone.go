@@ -17,6 +17,29 @@ import (
 	"github.com/sagernet/tailscale/types/ptr"
 )
 
+// Clone makes a deep copy of LoginProfile.
+// The result aliases no memory with the original.
+func (src *LoginProfile) Clone() *LoginProfile {
+	if src == nil {
+		return nil
+	}
+	dst := new(LoginProfile)
+	*dst = *src
+	return dst
+}
+
+// A compilation failure here means this code must be regenerated, with the command at the top of this file.
+var _LoginProfileCloneNeedsRegeneration = LoginProfile(struct {
+	ID             ProfileID
+	Name           string
+	NetworkProfile NetworkProfile
+	Key            StateKey
+	UserProfile    tailcfg.UserProfile
+	NodeID         tailcfg.StableNodeID
+	LocalUserID    WindowsUserID
+	ControlURL     string
+}{})
+
 // Clone makes a deep copy of Prefs.
 // The result aliases no memory with the original.
 func (src *Prefs) Clone() *Prefs {
@@ -38,43 +61,51 @@ func (src *Prefs) Clone() *Prefs {
 			}
 		}
 	}
+	if dst.RelayServerPort != nil {
+		dst.RelayServerPort = ptr.To(*src.RelayServerPort)
+	}
+	dst.RelayServerStaticEndpoints = append(src.RelayServerStaticEndpoints[:0:0], src.RelayServerStaticEndpoints...)
 	dst.Persist = src.Persist.Clone()
 	return dst
 }
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _PrefsCloneNeedsRegeneration = Prefs(struct {
-	ControlURL             string
-	RouteAll               bool
-	ExitNodeID             tailcfg.StableNodeID
-	ExitNodeIP             netip.Addr
-	InternalExitNodePrior  tailcfg.StableNodeID
-	ExitNodeAllowLANAccess bool
-	CorpDNS                bool
-	RunSSH                 bool
-	RunWebClient           bool
-	WantRunning            bool
-	LoggedOut              bool
-	ShieldsUp              bool
-	AdvertiseTags          []string
-	Hostname               string
-	NotepadURLs            bool
-	ForceDaemon            bool
-	Egg                    bool
-	AdvertiseRoutes        []netip.Prefix
-	AdvertiseServices      []string
-	NoSNAT                 bool
-	NoStatefulFiltering    opt.Bool
-	NetfilterMode          preftype.NetfilterMode
-	OperatorUser           string
-	ProfileName            string
-	AutoUpdate             AutoUpdatePrefs
-	AppConnector           AppConnectorPrefs
-	PostureChecking        bool
-	NetfilterKind          string
-	DriveShares            []*drive.Share
-	AllowSingleHosts       marshalAsTrueInJSON
-	Persist                *persist.Persist
+	ControlURL                 string
+	RouteAll                   bool
+	ExitNodeID                 tailcfg.StableNodeID
+	ExitNodeIP                 netip.Addr
+	AutoExitNode               ExitNodeExpression
+	InternalExitNodePrior      tailcfg.StableNodeID
+	ExitNodeAllowLANAccess     bool
+	CorpDNS                    bool
+	RunSSH                     bool
+	RunWebClient               bool
+	WantRunning                bool
+	LoggedOut                  bool
+	ShieldsUp                  bool
+	AdvertiseTags              []string
+	Hostname                   string
+	NotepadURLs                bool
+	ForceDaemon                bool
+	Egg                        bool
+	AdvertiseRoutes            []netip.Prefix
+	AdvertiseServices          []string
+	Sync                       opt.Bool
+	NoSNAT                     bool
+	NoStatefulFiltering        opt.Bool
+	NetfilterMode              preftype.NetfilterMode
+	OperatorUser               string
+	ProfileName                string
+	AutoUpdate                 AutoUpdatePrefs
+	AppConnector               AppConnectorPrefs
+	PostureChecking            bool
+	NetfilterKind              string
+	DriveShares                []*drive.Share
+	RelayServerPort            *uint16
+	RelayServerStaticEndpoints []netip.AddrPort
+	AllowSingleHosts           marshalAsTrueInJSON
+	Persist                    *persist.Persist
 }{})
 
 // Clone makes a deep copy of ServeConfig.
@@ -190,10 +221,11 @@ func (src *TCPPortHandler) Clone() *TCPPortHandler {
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _TCPPortHandlerCloneNeedsRegeneration = TCPPortHandler(struct {
-	HTTPS        bool
-	HTTP         bool
-	TCPForward   string
-	TerminateTLS string
+	HTTPS         bool
+	HTTP          bool
+	TCPForward    string
+	TerminateTLS  string
+	ProxyProtocol int
 }{})
 
 // Clone makes a deep copy of HTTPHandler.
@@ -204,14 +236,17 @@ func (src *HTTPHandler) Clone() *HTTPHandler {
 	}
 	dst := new(HTTPHandler)
 	*dst = *src
+	dst.AcceptAppCaps = append(src.AcceptAppCaps[:0:0], src.AcceptAppCaps...)
 	return dst
 }
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _HTTPHandlerCloneNeedsRegeneration = HTTPHandler(struct {
-	Path  string
-	Proxy string
-	Text  string
+	Path          string
+	Proxy         string
+	Text          string
+	AcceptAppCaps []tailcfg.PeerCapability
+	Redirect      string
 }{})
 
 // Clone makes a deep copy of WebServerConfig.
@@ -228,7 +263,7 @@ func (src *WebServerConfig) Clone() *WebServerConfig {
 			if v == nil {
 				dst.Handlers[k] = nil
 			} else {
-				dst.Handlers[k] = ptr.To(*v)
+				dst.Handlers[k] = v.Clone()
 			}
 		}
 	}

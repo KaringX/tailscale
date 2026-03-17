@@ -6,11 +6,13 @@ package controlhttp
 import (
 	"net/http"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/tailscale/health"
 	"github.com/sagernet/tailscale/net/dnscache"
 	"github.com/sagernet/tailscale/net/netmon"
+	"github.com/sagernet/tailscale/net/netx"
 	"github.com/sagernet/tailscale/tailcfg"
 	"github.com/sagernet/tailscale/tstime"
 	"github.com/sagernet/tailscale/types/key"
@@ -65,7 +67,7 @@ type Dialer struct {
 	// Dialer is the dialer used to make outbound connections.
 	//
 	// If not specified, this defaults to net.Dialer.DialContext.
-	Dialer dnscache.DialContextFunc
+	Dialer netx.DialFunc
 
 	// DNSCache is the caching Resolver used by this Dialer.
 	//
@@ -76,8 +78,8 @@ type Dialer struct {
 	// dropped.
 	Logf logger.Logf
 
-	// NetMon is the [netmon.Monitor] to use for this Dialer. It must be
-	// non-nil.
+	// NetMon is the [netmon.Monitor] to use for this Dialer.
+	// It is optional.
 	NetMon *netmon.Monitor
 
 	// HealthTracker, if non-nil, is the health tracker to use.
@@ -90,8 +92,12 @@ type Dialer struct {
 
 	proxyFunc func(*http.Request) (*url.URL, error) // or nil
 
+	// logPort80Failure is whether we should log about port 80 interceptions
+	// and forcing a port 443 dial. We do this only once per "dial" method
+	// which can result in many concurrent racing dialHost calls.
+	logPort80Failure atomic.Bool
+
 	// For tests only
-	drainFinished        chan struct{}
 	omitCertErrorLogging bool
 	testFallbackDelay    time.Duration
 

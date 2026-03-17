@@ -11,6 +11,7 @@ import (
 
 	"github.com/sagernet/tailscale/net/netaddr"
 	"github.com/sagernet/tailscale/types/logger"
+	"github.com/sagernet/tailscale/util/eventbus"
 	"golang.org/x/net/route"
 	"golang.org/x/sys/unix"
 )
@@ -24,7 +25,7 @@ type unspecifiedMessage struct{}
 
 func (unspecifiedMessage) ignore() bool { return false }
 
-func newOSMon(logf logger.Logf, _ *Monitor) (osMon, error) {
+func newOSMon(_ *eventbus.Bus, logf logger.Logf, _ *Monitor) (osMon, error) {
 	fd, err := unix.Socket(unix.AF_ROUTE, unix.SOCK_RAW, 0)
 	if err != nil {
 		return nil, err

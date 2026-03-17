@@ -6,12 +6,13 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"github.com/sagernet/tailscale/net/sockstats"
-	tailcfg "github.com/sagernet/tailscale/tailcfg"
 	"io"
 	"net"
 	"net/netip"
 	"time"
+
+	"github.com/sagernet/tailscale/net/sockstats"
+	tailcfg "github.com/sagernet/tailscale/tailcfg"
 )
 
 func (c *Client) DialRegionTLS(ctx context.Context, reg *tailcfg.DERPRegion) (tlsConn *tls.Conn, connClose io.Closer, node *tailcfg.DERPNode, err error) {

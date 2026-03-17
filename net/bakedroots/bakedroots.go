@@ -7,6 +7,7 @@ package bakedroots
 
 import (
 	"crypto/x509"
+	"fmt"
 	"sync"
 
 	"github.com/sagernet/tailscale/util/testenv"
@@ -14,7 +15,7 @@ import (
 
 // Get returns the baked-in roots.
 //
-// As of 2025-01-21, this includes only the LetsEncrypt ISRG Root X1 root.
+// As of 2025-01-21, this includes only the LetsEncrypt ISRG Root X1 & X2 roots.
 func Get() *x509.CertPool {
 	roots.once.Do(func() {
 		roots.parsePEM(append(
@@ -25,16 +26,9 @@ func Get() *x509.CertPool {
 	return roots.p
 }
 
-// testingTB is a subset of testing.TB needed
-// to verify the caller isn't in a parallel test.
-type testingTB interface {
-	// Setenv panics if it's in a parallel test.
-	Setenv(k, v string)
-}
-
 // ResetForTest resets the cached roots for testing,
 // optionally setting them to caPEM if non-nil.
-func ResetForTest(tb testingTB, caPEM []byte) {
+func ResetForTest(tb testenv.TB, caPEM []byte) {
 	if !testenv.InTest() {
 		panic("not in test")
 	}
@@ -43,6 +37,10 @@ func ResetForTest(tb testingTB, caPEM []byte) {
 	roots = rootsOnce{}
 	if caPEM != nil {
 		roots.once.Do(func() { roots.parsePEM(caPEM) })
+		tb.Cleanup(func() {
+			// Reset the roots to real roots for any following test.
+			roots = rootsOnce{}
+		})
 	}
 }
 
@@ -56,7 +54,7 @@ type rootsOnce struct {
 func (r *rootsOnce) parsePEM(caPEM []byte) {
 	p := x509.NewCertPool()
 	if !p.AppendCertsFromPEM(caPEM) {
-		panic("bogus PEM")
+		panic(fmt.Sprintf("bogus PEM: %q", caPEM))
 	}
 	r.p = p
 }

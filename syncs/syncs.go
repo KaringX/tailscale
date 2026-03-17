@@ -67,12 +67,18 @@ func (v *AtomicValue[T]) Swap(x T) (old T) {
 	if oldV != nil {
 		return oldV.(wrappedValue[T]).v
 	}
-	return old
+	return old // zero value of T
 }
 
 // CompareAndSwap executes the compare-and-swap operation for the Value.
+// It panics if T is not comparable.
 func (v *AtomicValue[T]) CompareAndSwap(oldV, newV T) (swapped bool) {
-	return v.v.CompareAndSwap(wrappedValue[T]{oldV}, wrappedValue[T]{newV})
+	var zero T
+	return v.v.CompareAndSwap(wrappedValue[T]{oldV}, wrappedValue[T]{newV}) ||
+		// In the edge-case where [atomic.Value.Store] is uninitialized
+		// and trying to compare with the zero value of T,
+		// then compare-and-swap with the nil any value.
+		(any(oldV) == any(zero) && v.v.CompareAndSwap(any(nil), wrappedValue[T]{newV}))
 }
 
 // MutexValue is a value protected by a mutex.
@@ -193,6 +199,13 @@ type Semaphore struct {
 // NewSemaphore returns a semaphore with resource count n.
 func NewSemaphore(n int) Semaphore {
 	return Semaphore{c: make(chan struct{}, n)}
+}
+
+// Len reports the number of in-flight acquisitions.
+// It is incremented whenever the semaphore is acquired.
+// It is decremented whenever the semaphore is released.
+func (s Semaphore) Len() int {
+	return len(s.c)
 }
 
 // Acquire blocks until a resource is acquired.
@@ -395,20 +408,4 @@ func (m *Map[K, V]) Swap(key K, value V) (oldValue V) {
 	oldValue = m.m[key]
 	mak.Set(&m.m, key, value)
 	return oldValue
-}
-
-// WaitGroup is identical to [sync.WaitGroup],
-// but provides a Go method to start a goroutine.
-type WaitGroup struct{ sync.WaitGroup }
-
-// Go calls the given function in a new goroutine.
-// It automatically increments the counter before execution and
-// automatically decrements the counter after execution.
-// It must not be called concurrently with Wait.
-func (wg *WaitGroup) Go(f func()) {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		f()
-	}()
 }

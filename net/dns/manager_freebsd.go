@@ -10,12 +10,13 @@ import (
 	"github.com/sagernet/tailscale/control/controlknobs"
 	"github.com/sagernet/tailscale/health"
 	"github.com/sagernet/tailscale/types/logger"
+	"github.com/sagernet/tailscale/util/syspolicy/policyclient"
 )
 
 // NewOSConfigurator creates a new OS configurator.
 //
 // The health tracker may be nil; the knobs may be nil and are ignored on this platform.
-func NewOSConfigurator(logf logger.Logf, health *health.Tracker, _ *controlknobs.Knobs, _ string) (OSConfigurator, error) {
+func NewOSConfigurator(logf logger.Logf, health *health.Tracker, _ policyclient.Client, _ *controlknobs.Knobs, _ string) (OSConfigurator, error) {
 	bs, err := os.ReadFile("/etc/resolv.conf")
 	if os.IsNotExist(err) {
 		return newDirectManager(logf, health), nil

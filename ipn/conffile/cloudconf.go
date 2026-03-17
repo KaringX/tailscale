@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/sagernet/tailscale/feature"
+	"github.com/sagernet/tailscale/feature/buildfeatures"
 	"github.com/sagernet/tailscale/omit"
 )
 
@@ -35,6 +37,9 @@ func getEC2MetadataToken() (string, error) {
 }
 
 func readVMUserData() ([]byte, error) {
+	if !buildfeatures.HasAWS {
+		return nil, feature.ErrUnavailable
+	}
 	// TODO(bradfitz): support GCP, Azure, Proxmox/cloud-init
 	// (NoCloud/ConfigDrive ISO), etc.
 

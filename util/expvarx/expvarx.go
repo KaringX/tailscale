@@ -7,9 +7,9 @@ package expvarx
 import (
 	"encoding/json"
 	"expvar"
-	"sync"
 	"time"
 
+	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/types/lazy"
 )
 
@@ -20,7 +20,7 @@ type SafeFunc struct {
 	limit  time.Duration
 	onSlow func(time.Duration, any)
 
-	mu       sync.Mutex
+	mu       syncs.Mutex
 	inflight *lazy.SyncValue[any]
 }
 

@@ -27,12 +27,18 @@ import (
 	"time"
 
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/tailscale/client/tailscale"
+	"github.com/sagernet/tailscale/client/local"
 	"github.com/sagernet/tailscale/control/controlclient"
 	"github.com/sagernet/tailscale/envknob"
-	_ "github.com/sagernet/tailscale/feature/condregister"
+	_ "github.com/sagernet/tailscale/feature/c2n"
+	_ "github.com/sagernet/tailscale/feature/condregister/osrouter"
+	_ "github.com/sagernet/tailscale/feature/condregister/oauthkey"
+	_ "github.com/sagernet/tailscale/feature/condregister/portmapper"
+	_ "github.com/sagernet/tailscale/feature/condregister/useproxy"
 	"github.com/sagernet/tailscale/health"
+	"github.com/sagernet/tailscale/internal/client/tailscale"
 	"github.com/sagernet/tailscale/ipn"
+	"github.com/sagernet/tailscale/ipn/ipnauth"
 	"github.com/sagernet/tailscale/ipn/ipnlocal"
 	"github.com/sagernet/tailscale/ipn/ipnstate"
 	"github.com/sagernet/tailscale/ipn/localapi"
@@ -49,6 +55,7 @@ import (
 	"github.com/sagernet/tailscale/net/socks5"
 	"github.com/sagernet/tailscale/net/tsdial"
 	"github.com/sagernet/tailscale/tsd"
+	"github.com/sagernet/tailscale/types/bools"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/types/logid"
 	"github.com/sagernet/tailscale/types/nettype"
@@ -58,6 +65,8 @@ import (
 	"github.com/sagernet/tailscale/util/testenv"
 	"github.com/sagernet/tailscale/wgengine"
 	"github.com/sagernet/tailscale/wgengine/netstack"
+	"github.com/sagernet/tailscale/wgengine/router"
+	wgTun "github.com/sagernet/wireguard-go/tun"
 )
 
 // Server is an embedded Tailscale server.
@@ -124,11 +133,19 @@ type Server struct {
 	// field at zero unless you know what you are doing.
 	Port uint16
 
+	// AdvertiseTags specifies tags that should be applied to this node, for
+	// purposes of ACL enforcement. These can be referenced from the ACL policy
+	// document. Note that advertising a tag on the client doesn't guarantee
+	// that the control server will allow the node to adopt that tag.
+	AdvertiseTags []string
+
 	Dialer     N.Dialer
 	LookupHook dnscache.LookupHookFunc
 	OnlyTCP443 bool
 	DNS        dns.OSConfigurator
 	HTTPClient *http.Client
+	TunDevice  wgTun.Device
+	Router     router.Router
 
 	getCertForTesting func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 
@@ -142,11 +159,11 @@ type Server struct {
 	hostname         string
 	shutdownCtx      context.Context
 	shutdownCancel   context.CancelFunc
-	proxyCred        string                 // SOCKS5 proxy auth for loopbackListener
-	localAPICred     string                 // basic auth password for loopbackListener
-	loopbackListener net.Listener           // optional loopback for localapi and proxies
-	localAPIListener net.Listener           // in-memory, used by localClient
-	localClient      *tailscale.LocalClient // in-memory
+	proxyCred        string        // SOCKS5 proxy auth for loopbackListener
+	localAPICred     string        // basic auth password for loopbackListener
+	loopbackListener net.Listener  // optional loopback for localapi and proxies
+	localAPIListener net.Listener  // in-memory, used by localClient
+	localClient      *local.Client // in-memory
 	localAPIServer   *http.Server
 	logbuffer        *filch.Filch
 	logtail          *logtail.Logger
@@ -217,7 +234,7 @@ func (s *Server) awaitRunning(ctx context.Context) error {
 //
 // It will start the server if it has not been started yet. If the server's
 // already been started successfully, it doesn't return an error.
-func (s *Server) LocalClient() (*tailscale.LocalClient, error) {
+func (s *Server) LocalClient() (*local.Client, error) {
 	if err := s.Start(); err != nil {
 		return nil, err
 	}
@@ -268,7 +285,14 @@ func (s *Server) Loopback() (addr string, proxyCred, localAPICred string, err er
 		// out the CONNECT code from tailscaled/proxy.go that uses
 		// httputil.ReverseProxy and adding auth support.
 		go func() {
-			lah := localapi.NewHandler(s.lb, s.logf, s.logid, s.netMon.Dialer())
+			lah := localapi.NewHandler(localapi.HandlerConfig{
+				Actor:    ipnauth.Self,
+				Backend:  s.lb,
+				Logf:     s.logf,
+				LogID:    s.logid,
+				EventBus: s.sys.Bus.Get(),
+				Dialer:   s.netMon.Dialer(),
+			})
 			lah.PermitWrite = true
 			lah.PermitRead = true
 			lah.RequiredPassword = s.localAPICred
@@ -327,7 +351,7 @@ func (s *Server) Up(ctx context.Context) (*ipnstate.Status, error) {
 		return nil, fmt.Errorf("tsnet.Up: %w", err)
 	}
 
-	watcher, err := lc.WatchIPNBus(ctx, ipn.NotifyInitialState|ipn.NotifyNoPrivateKeys)
+	watcher, err := lc.WatchIPNBus(ctx, ipn.NotifyInitialState)
 	if err != nil {
 		return nil, fmt.Errorf("tsnet.Up: %w", err)
 	}
@@ -427,8 +451,8 @@ func (s *Server) Close() error {
 	for _, ln := range s.listeners {
 		ln.closeLocked()
 	}
-
 	wg.Wait()
+	s.sys.Bus.Get().Close()
 	s.closed = true
 	return nil
 }
@@ -474,6 +498,16 @@ func (s *Server) TailscaleIPs() (ip4, ip6 netip.Addr) {
 	return ip4, ip6
 }
 
+// LogtailWriter returns an [io.Writer] that writes to Tailscale's logging service and will be only visible to Tailscale's
+// support team. Logs written there cannot be retrieved by the user. This method always returns a non-nil value.
+func (s *Server) LogtailWriter() io.Writer {
+	if s.logtail == nil {
+		return io.Discard
+	}
+
+	return s.logtail
+}
+
 func (s *Server) getAuthKey() string {
 	if v := s.AuthKey; v != "" {
 		return v
@@ -496,6 +530,11 @@ func (s *Server) start() (reterr error) {
 			// 1.21), but we don't really care much: it's only used as a default
 			// directory and hostname when they're not supplied. But we can fall
 			// back to "tsnet" as well.
+			exe = "tsnet"
+		case "ios":
+			// When compiled as a framework (via TailscaleKit in libtailscale),
+			// os.Executable() returns an error, so fall back to "tsnet" there
+			// too.
 			exe = "tsnet"
 		default:
 			return err
@@ -521,10 +560,7 @@ func (s *Server) start() (reterr error) {
 		if err != nil {
 			return err
 		}
-		s.rootPath, err = getTSNetDir(s.logf, confDir, prog)
-		if err != nil {
-			return err
-		}
+		s.rootPath = filepath.Join(confDir, "tsnet-"+prog)
 	}
 	if err := os.MkdirAll(s.rootPath, 0o700); err != nil {
 		return err
@@ -542,38 +578,58 @@ func (s *Server) start() (reterr error) {
 		if s.Logf == nil {
 			return
 		}
-		s.Logf(format, a...)
+		// Format the log message and remove the [v\x00JSON] prefix
+		// that is used internally by logtail for structured logging.
+		// See: https://github.com/SagerNet/sing-box/issues/3481
+		msg := fmt.Sprintf(format, a...)
+		msg = removeJSONLogPrefix(msg)
+		s.Logf("%s", msg)
 	}
 
-	sys := new(tsd.System)
+	sys := tsd.NewSystem()
 	s.sys = sys
-	if err := s.startLogger(&closePool, sys.HealthTracker(), tsLogf); err != nil {
+	if err := s.startLogger(&closePool, sys.HealthTracker.Get(), tsLogf); err != nil {
 		return err
 	}
 
-	s.netMon, err = netmon.New(tsLogf, s.Dialer)
+	s.netMon, err = netmon.New(sys.Bus.Get(), tsLogf, s.Dialer)
 	if err != nil {
 		return err
 	}
 	closePool.add(s.netMon)
 
 	s.dialer = &tsdial.Dialer{Logf: tsLogf, Dialer: s.Dialer} // mutated below (before used)
-	eng, err := wgengine.NewUserspaceEngine(tsLogf, wgengine.Config{
+	s.dialer.SetBus(sys.Bus.Get())
+	engineConfig := wgengine.Config{
 		DNS:           s.DNS,
+		EventBus:      sys.Bus.Get(),
 		ListenPort:    s.Port,
 		NetMon:        s.netMon,
 		Dialer:        s.dialer,
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
-		HealthTracker: sys.HealthTracker(),
+		HealthTracker: sys.HealthTracker.Get(),
 		Metrics:       sys.UserMetricsRegistry(),
-	})
+	}
+	if s.TunDevice != nil {
+		engineConfig.Tun = s.TunDevice
+		if s.Router != nil {
+			engineConfig.Router = s.Router
+		} else {
+			systemRouter, err := router.New(tsLogf, s.TunDevice, s.netMon, sys.HealthTracker.Get(), sys.Bus.Get())
+			if err != nil {
+				return err
+			}
+			engineConfig.Router = systemRouter
+		}
+	}
+	eng, err := wgengine.NewUserspaceEngine(tsLogf, engineConfig)
 	if err != nil {
 		return err
 	}
 	closePool.add(s.dialer)
 	sys.Set(eng)
-	sys.HealthTracker().SetMetricsRegistry(sys.UserMetricsRegistry())
+	sys.HealthTracker.Get().SetMetricsRegistry(sys.UserMetricsRegistry())
 
 	// TODO(oxtoacart): do we need to support Taildrive on tsnet, and if so, how?
 	ns, err := netstack.Create(tsLogf, sys.Tun.Get(), eng, sys.MagicSock.Get(), s.dialer, sys.DNSManager.Get(), sys.ProxyMapper())
@@ -595,7 +651,9 @@ func (s *Server) start() (reterr error) {
 		// Note: don't just return ns.DialContextTCP or we'll return
 		// *gonet.TCPConn(nil) instead of a nil interface which trips up
 		// callers.
-		tcpConn, err := ns.DialContextTCP(ctx, dst)
+		v4, v6 := s.TailscaleIPs()
+		src := bools.IfElse(dst.Addr().Is6(), v6, v4)
+		tcpConn, err := ns.DialContextTCPWithBind(ctx, src, dst)
 		if err != nil {
 			return nil, err
 		}
@@ -605,7 +663,9 @@ func (s *Server) start() (reterr error) {
 		// Note: don't just return ns.DialContextUDP or we'll return
 		// *gonet.UDPConn(nil) instead of a nil interface which trips up
 		// callers.
-		udpConn, err := ns.DialContextUDP(ctx, dst)
+		v4, v6 := s.TailscaleIPs()
+		src := bools.IfElse(dst.Addr().Is6(), v6, v4)
+		udpConn, err := ns.DialContextUDPWithBind(ctx, src, dst)
 		if err != nil {
 			return nil, err
 		}
@@ -644,7 +704,16 @@ func (s *Server) start() (reterr error) {
 	prefs.WantRunning = true
 	prefs.ControlURL = s.ControlURL
 	prefs.RunWebClient = s.RunWebClient
+	prefs.AdvertiseTags = s.AdvertiseTags
 	authKey := s.getAuthKey()
+	// Try to use an OAuth secret to generate an auth key if that functionality
+	// is available.
+	if f, ok := tailscale.HookResolveAuthKey.GetOk(); ok {
+		authKey, err = f(s.shutdownCtx, s.getAuthKey(), prefs.AdvertiseTags)
+		if err != nil {
+			return fmt.Errorf("resolving auth key: %w", err)
+		}
+	}
 	err = lb.Start(ipn.Options{
 		UpdatePrefs: prefs,
 		AuthKey:     authKey,
@@ -664,7 +733,14 @@ func (s *Server) start() (reterr error) {
 	// go s.printAuthURLLoop()
 
 	// Run the localapi handler, to allow fetching LetsEncrypt certs.
-	lah := localapi.NewHandler(lb, tsLogf, s.logid, s.netMon.Dialer())
+	lah := localapi.NewHandler(localapi.HandlerConfig{
+		Actor:    ipnauth.Self,
+		Backend:  lb,
+		Logf:     tsLogf,
+		LogID:    s.logid,
+		EventBus: sys.Bus.Get(),
+		Dialer:   s.netMon.Dialer(),
+	})
 	lah.PermitWrite = true
 	lah.PermitRead = true
 
@@ -672,7 +748,7 @@ func (s *Server) start() (reterr error) {
 	// nettest.Listen provides a in-memory pipe based implementation for net.Conn.
 	lal := memnet.Listen("local-tailscaled.sock:80")
 	s.localAPIListener = lal
-	s.localClient = &tailscale.LocalClient{Dial: lal.Dial}
+	s.localClient = &local.Client{Dial: lal.Dial}
 	s.localAPIServer = &http.Server{Handler: lah}
 	s.lb.ConfigureWebClient(s.localClient)
 	go func() {
@@ -715,6 +791,7 @@ func (s *Server) startLogger(closePool *closeOnErrorPool, health *health.Tracker
 		Stderr:       io.Discard, // log everything to Buffer
 		Buffer:       s.logbuffer,
 		CompressLogs: true,
+		Bus:          s.sys.Bus.Get(),
 		HTTPC:        &http.Client{Transport: logpolicy.NewLogtailTransport(logtail.DefaultHost, s.netMon, health, tsLogf)},
 		MetricsDelta: clientmetric.EncodeLogTailMetricsDelta,
 	}
@@ -883,66 +960,6 @@ func (s *Server) getUDPHandlerForFlow(src, dst netip.AddrPort) (handler func(net
 	return func(c nettype.ConnPacketConn) { ln.handle(c) }, true
 }
 
-// getTSNetDir usually just returns filepath.Join(confDir, "tsnet-"+prog)
-// with no error.
-//
-// One special case is that it renames old "tslib-" directories to
-// "tsnet-", and that rename might return an error.
-//
-// TODO(bradfitz): remove this maybe 6 months after 2022-03-17,
-// once people (notably Tailscale corp services) have updated.
-func getTSNetDir(logf logger.Logf, confDir, prog string) (string, error) {
-	oldPath := filepath.Join(confDir, "tslib-"+prog)
-	newPath := filepath.Join(confDir, "tsnet-"+prog)
-
-	fi, err := os.Lstat(oldPath)
-	if os.IsNotExist(err) {
-		// Common path.
-		return newPath, nil
-	}
-	if err != nil {
-		return "", err
-	}
-	if !fi.IsDir() {
-		return "", fmt.Errorf("expected old tslib path %q to be a directory; got %v", oldPath, fi.Mode())
-	}
-
-	// At this point, oldPath exists and is a directory. But does
-	// the new path exist?
-
-	fi, err = os.Lstat(newPath)
-	if err == nil && fi.IsDir() {
-		// New path already exists somehow. Ignore the old one and
-		// don't try to migrate it.
-		return newPath, nil
-	}
-	if err != nil && !os.IsNotExist(err) {
-		return "", err
-	}
-	if err := os.Rename(oldPath, newPath); err != nil {
-		return "", err
-	}
-	logf("renamed old tsnet state storage directory %q to %q", oldPath, newPath)
-	return newPath, nil
-}
-
-// APIClient returns a tailscale.Client that can be used to make authenticated
-// requests to the Tailscale control server.
-// It requires the user to set tailscale.I_Acknowledge_This_API_Is_Unstable.
-func (s *Server) APIClient() (*tailscale.Client, error) {
-	if !tailscale.I_Acknowledge_This_API_Is_Unstable {
-		return nil, errors.New("use of Client without setting I_Acknowledge_This_API_Is_Unstable")
-	}
-	if err := s.Start(); err != nil {
-		return nil, err
-	}
-
-	c := tailscale.NewClient("-", nil)
-	c.UserAgent = "tailscale-tsnet"
-	c.HTTPClient = &http.Client{Transport: s.lb.KeyProvingNoiseRoundTripper()}
-	return c, nil
-}
-
 // Listen announces only on the Tailscale network.
 // It will start the server if it has not been started yet.
 //
@@ -1049,13 +1066,33 @@ type FunnelOption interface {
 	funnelOption()
 }
 
-type funnelOnly int
+type funnelOnly struct{}
 
 func (funnelOnly) funnelOption() {}
 
 // FunnelOnly configures the listener to only respond to connections from Tailscale Funnel.
 // The local tailnet will not be able to connect to the listener.
-func FunnelOnly() FunnelOption { return funnelOnly(1) }
+func FunnelOnly() FunnelOption { return funnelOnly{} }
+
+type funnelTLSConfig struct{ conf *tls.Config }
+
+func (f funnelTLSConfig) funnelOption() {}
+
+// FunnelTLSConfig configures the TLS configuration for [Server.ListenFunnel]
+//
+// This is rarely needed but can permit requiring client certificates, specific
+// ciphers suites, etc.
+//
+// The provided conf should at least be able to get a certificate, setting
+// GetCertificate, Certificates or GetConfigForClient appropriately.
+// The most common configuration is to set GetCertificate to
+// Server.LocalClient's GetCertificate method.
+//
+// Unless [FunnelOnly] is also used, the configuration is also used for
+// in-tailnet connections that don't arrive over Funnel.
+func FunnelTLSConfig(conf *tls.Config) FunnelOption {
+	return funnelTLSConfig{conf: conf}
+}
 
 // ListenFunnel announces on the public internet using Tailscale Funnel.
 //
@@ -1086,6 +1123,26 @@ func (s *Server) ListenFunnel(network, addr string, opts ...FunnelOption) (net.L
 	port, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
 		return nil, err
+	}
+
+	// Process, validate opts.
+	lnOn := listenOnBoth
+	var tlsConfig *tls.Config
+	for _, opt := range opts {
+		switch v := opt.(type) {
+		case funnelTLSConfig:
+			if v.conf == nil {
+				return nil, errors.New("invalid nil FunnelTLSConfig")
+			}
+			tlsConfig = v.conf
+		case funnelOnly:
+			lnOn = listenOnFunnel
+		default:
+			return nil, fmt.Errorf("unknown opts FunnelOption type %T", v)
+		}
+	}
+	if tlsConfig == nil {
+		tlsConfig = &tls.Config{GetCertificate: s.getCert}
 	}
 
 	ctx := context.Background()
@@ -1125,19 +1182,11 @@ func (s *Server) ListenFunnel(network, addr string, opts ...FunnelOption) (net.L
 	}
 
 	// Start a funnel listener.
-	lnOn := listenOnBoth
-	for _, opt := range opts {
-		if _, ok := opt.(funnelOnly); ok {
-			lnOn = listenOnFunnel
-		}
-	}
 	ln, err := s.listen(network, addr, lnOn)
 	if err != nil {
 		return nil, err
 	}
-	return tls.NewListener(ln, &tls.Config{
-		GetCertificate: s.getCert,
-	}), nil
+	return tls.NewListener(ln, tlsConfig), nil
 }
 
 type listenOn string
@@ -1232,6 +1281,12 @@ func (s *Server) listen(network, addr string, lnOn listenOn) (net.Listener, erro
 	}
 	s.mu.Unlock()
 	return ln, nil
+}
+
+// GetRootPath returns the root path of the tsnet server.
+// This is where the state file and other data is stored.
+func (s *Server) GetRootPath() string {
+	return s.rootPath
 }
 
 // CapturePcap can be called by the application code compiled with tsnet to save a pcap
@@ -1339,3 +1394,23 @@ type addr struct{ ln *listener }
 
 func (a addr) Network() string { return a.ln.keys[0].network }
 func (a addr) String() string  { return a.ln.addr }
+
+// vJSONPrefix is the magic prefix used by logtail for structured JSON logging.
+// The null byte (\x00) is used as a marker that logtail recognizes and strips,
+// but if the log bypasses logtail processing, it appears in the output.
+const vJSONPrefix = "[v\x00JSON]"
+
+// removeJSONLogPrefix removes the [v\x00JSON] prefix and log level digit
+// from a log message. This prefix is used internally by tailscale's logger
+// for structured logging, but should not appear in user-visible logs.
+func removeJSONLogPrefix(msg string) string {
+	if idx := strings.Index(msg, vJSONPrefix); idx != -1 {
+		rest := msg[idx+len(vJSONPrefix):]
+		if len(rest) >= 1 && rest[0] >= '0' && rest[0] <= '9' {
+			// Skip the log level digit
+			return msg[:idx] + rest[1:]
+		}
+		return msg[:idx] + rest
+	}
+	return msg
+}

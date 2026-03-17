@@ -5,8 +5,8 @@
 package web
 
 import (
+	"cmp"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,19 +14,20 @@ import (
 	"log"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"path"
-	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gorilla/csrf"
-	"github.com/sagernet/tailscale/client/tailscale"
+	"github.com/sagernet/tailscale/client/local"
 	"github.com/sagernet/tailscale/client/tailscale/apitype"
-	"github.com/sagernet/tailscale/clientupdate"
 	"github.com/sagernet/tailscale/envknob"
 	"github.com/sagernet/tailscale/envknob/featureknob"
+	"github.com/sagernet/tailscale/feature"
+	"github.com/sagernet/tailscale/feature/buildfeatures"
 	"github.com/sagernet/tailscale/hostinfo"
 	"github.com/sagernet/tailscale/ipn"
 	"github.com/sagernet/tailscale/ipn/ipnstate"
@@ -37,6 +38,7 @@ import (
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/types/views"
 	"github.com/sagernet/tailscale/util/httpm"
+	"github.com/sagernet/tailscale/util/syspolicy/policyclient"
 	"github.com/sagernet/tailscale/version"
 	"github.com/sagernet/tailscale/version/distro"
 )
@@ -50,7 +52,8 @@ type Server struct {
 	mode ServerMode
 
 	logf    logger.Logf
-	lc      *tailscale.LocalClient
+	polc    policyclient.Client // must be non-nil
+	lc      *local.Client
 	timeNow func() time.Time
 
 	// devMode indicates that the server run with frontend assets
@@ -59,6 +62,12 @@ type Server struct {
 	devMode    bool
 	cgiMode    bool
 	pathPrefix string
+
+	// originOverride is the origin that the web UI is accessible from.
+	// This value is used in the fallback CSRF checks when Sec-Fetch-Site is not
+	// available. In this case the application will compare Host and Origin
+	// header values to determine if the request is from the same origin.
+	originOverride string
 
 	apiHandler    http.Handler // serves api endpoints; csrf-protected
 	assetsHandler http.Handler // serves frontend assets
@@ -125,17 +134,21 @@ type ServerOpts struct {
 	// PathPrefix is the URL prefix added to requests by CGI or reverse proxy.
 	PathPrefix string
 
-	// LocalClient is the tailscale.LocalClient to use for this web server.
+	// LocalClient is the local.Client to use for this web server.
 	// If nil, a new one will be created.
-	LocalClient *tailscale.LocalClient
+	LocalClient *local.Client
 
 	// TimeNow optionally provides a time function.
 	// time.Now is used as default.
 	TimeNow func() time.Time
 
 	// Logf optionally provides a logger function.
-	// log.Printf is used as default.
+	// If nil, log.Printf is used as default.
 	Logf logger.Logf
+
+	// PolicyClient, if non-nil, will be used to fetch policy settings.
+	// If nil, the default policy client will be used.
+	PolicyClient policyclient.Client
 
 	// The following two fields are required and used exclusively
 	// in ManageServerMode to facilitate the control server login
@@ -150,6 +163,9 @@ type ServerOpts struct {
 	// as completed.
 	// This field is required for ManageServerMode mode.
 	WaitAuthURL func(ctx context.Context, id string, src tailcfg.NodeID) (*tailcfg.WebClientAuthResponse, error)
+
+	// OriginOverride specifies the origin that the web UI will be accessible from if hosted behind a reverse proxy or CGI.
+	OriginOverride string
 }
 
 // NewServer constructs a new Tailscale web client server.
@@ -166,18 +182,20 @@ func NewServer(opts ServerOpts) (s *Server, err error) {
 		return nil, fmt.Errorf("invalid Mode provided")
 	}
 	if opts.LocalClient == nil {
-		opts.LocalClient = &tailscale.LocalClient{}
+		opts.LocalClient = &local.Client{}
 	}
 	s = &Server{
-		mode:        opts.Mode,
-		logf:        opts.Logf,
-		devMode:     envknob.Bool("TS_DEBUG_WEB_CLIENT_DEV"),
-		lc:          opts.LocalClient,
-		cgiMode:     opts.CGIMode,
-		pathPrefix:  opts.PathPrefix,
-		timeNow:     opts.TimeNow,
-		newAuthURL:  opts.NewAuthURL,
-		waitAuthURL: opts.WaitAuthURL,
+		mode:           opts.Mode,
+		polc:           cmp.Or(opts.PolicyClient, policyclient.Get()),
+		logf:           opts.Logf,
+		devMode:        envknob.Bool("TS_DEBUG_WEB_CLIENT_DEV"),
+		lc:             opts.LocalClient,
+		cgiMode:        opts.CGIMode,
+		pathPrefix:     opts.PathPrefix,
+		timeNow:        opts.TimeNow,
+		newAuthURL:     opts.NewAuthURL,
+		waitAuthURL:    opts.WaitAuthURL,
+		originOverride: opts.OriginOverride,
 	}
 	if opts.PathPrefix != "" {
 		// Enforce that path prefix always has a single leading '/'
@@ -205,7 +223,7 @@ func NewServer(opts ServerOpts) (s *Server, err error) {
 
 	var metric string
 	s.apiHandler, metric = s.modeAPIHandler(s.mode)
-	s.apiHandler = s.withCSRF(s.apiHandler)
+	s.apiHandler = s.csrfProtect(s.apiHandler)
 
 	// Don't block startup on reporting metric.
 	// Report in separate go routine with 5 second timeout.
@@ -218,23 +236,63 @@ func NewServer(opts ServerOpts) (s *Server, err error) {
 	return s, nil
 }
 
-func (s *Server) withCSRF(h http.Handler) http.Handler {
-	csrfProtect := csrf.Protect(s.csrfKey(), csrf.Secure(false))
-
-	// ref https://github.com/tailscale/tailscale/pull/14822
-	// signal to the CSRF middleware that the request is being served over
-	// plaintext HTTP to skip TLS-only header checks.
-	withSetPlaintext := func(h http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			r = csrf.PlaintextHTTPRequest(r)
+func (s *Server) csrfProtect(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// CSRF is not required for GET, HEAD, or OPTIONS requests.
+		if slices.Contains([]string{"GET", "HEAD", "OPTIONS"}, r.Method) {
 			h.ServeHTTP(w, r)
-		})
-	}
+			return
+		}
 
-	// NB: the order of the withSetPlaintext and csrfProtect calls is important
-	// to ensure that we signal to the CSRF middleware that the request is being
-	// served over plaintext HTTP and not over TLS as it presumes by default.
-	return withSetPlaintext(csrfProtect(h))
+		// first attempt to use Sec-Fetch-Site header (sent by all modern
+		// browsers to "potentially trustworthy" origins i.e. localhost or those
+		// served over HTTPS)
+		secFetchSite := r.Header.Get("Sec-Fetch-Site")
+		if secFetchSite == "same-origin" {
+			h.ServeHTTP(w, r)
+			return
+		} else if secFetchSite != "" {
+			http.Error(w, fmt.Sprintf("CSRF request denied with Sec-Fetch-Site %q", secFetchSite), http.StatusForbidden)
+			return
+		}
+
+		// if Sec-Fetch-Site is not available we presume we are operating over HTTP.
+		// We fall back to comparing the Origin & Host headers.
+
+		// use the Host header to determine the expected origin
+		// (use the override if set to allow for reverse proxying)
+		host := r.Host
+		if host == "" {
+			http.Error(w, "CSRF request denied with no Host header", http.StatusForbidden)
+			return
+		}
+		if s.originOverride != "" {
+			host = s.originOverride
+		}
+
+		originHeader := r.Header.Get("Origin")
+		if originHeader == "" {
+			http.Error(w, "CSRF request denied with no Origin header", http.StatusForbidden)
+			return
+		}
+		parsedOrigin, err := url.Parse(originHeader)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("CSRF request denied with invalid Origin %q", r.Header.Get("Origin")), http.StatusForbidden)
+			return
+		}
+		origin := parsedOrigin.Host
+		if origin == "" {
+			http.Error(w, "CSRF request denied with no host in the Origin header", http.StatusForbidden)
+			return
+		}
+
+		if origin != host {
+			http.Error(w, fmt.Sprintf("CSRF request denied with mismatched Origin %q and Host %q", origin, host), http.StatusForbidden)
+			return
+		}
+
+		h.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) modeAPIHandler(mode ServerMode) (http.Handler, string) {
@@ -335,7 +393,8 @@ func (s *Server) requireTailscaleIP(w http.ResponseWriter, r *http.Request) (han
 		ipv6ServiceHost = "[" + tsaddr.TailscaleServiceIPv6String + "]"
 	)
 	// allow requests on quad-100 (or ipv6 equivalent)
-	if r.Host == ipv4ServiceHost || r.Host == ipv6ServiceHost {
+	host := strings.TrimSuffix(r.Host, ":80")
+	if host == ipv4ServiceHost || host == ipv6ServiceHost {
 		return false
 	}
 
@@ -437,6 +496,10 @@ func (s *Server) authorizeRequest(w http.ResponseWriter, r *http.Request) (ok bo
 	// Client using system-specific auth.
 	switch distro.Get() {
 	case distro.Synology:
+		if !buildfeatures.HasSynology {
+			// Synology support not built in.
+			return false
+		}
 		authorized, _ := authorizeSynology(r)
 		return authorized
 	case distro.QNAP:
@@ -451,7 +514,6 @@ func (s *Server) authorizeRequest(w http.ResponseWriter, r *http.Request) (ok bo
 // It should only be called by Server.ServeHTTP, via Server.apiHandler,
 // which protects the handler using gorilla csrf.
 func (s *Server) serveLoginAPI(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("X-CSRF-Token", csrf.Token(r))
 	switch {
 	case r.URL.Path == "/api/data" && r.Method == httpm.GET:
 		s.serveGetNodeData(w, r)
@@ -574,7 +636,6 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	w.Header().Set("X-CSRF-Token", csrf.Token(r))
 	path := strings.TrimPrefix(r.URL.Path, "/api")
 	switch {
 	case path == "/data" && r.Method == httpm.GET:
@@ -901,7 +962,7 @@ func (s *Server) serveGetNodeData(w http.ResponseWriter, r *http.Request) {
 		UnraidToken:      os.Getenv("UNRAID_CSRF_TOKEN"),
 		RunningSSHServer: prefs.RunSSH,
 		URLPrefix:        strings.TrimSuffix(s.pathPrefix, "/"),
-		ControlAdminURL:  prefs.AdminPageURL(),
+		ControlAdminURL:  prefs.AdminPageURL(s.polc),
 		LicensesURL:      licenses.LicensesURL(),
 		Features:         availableFeatures(),
 
@@ -921,9 +982,18 @@ func (s *Server) serveGetNodeData(w http.ResponseWriter, r *http.Request) {
 		data.ClientVersion = cv
 	}
 
-	if st.CurrentTailnet != nil {
-		data.TailnetName = st.CurrentTailnet.MagicDNSSuffix
-		data.DomainName = st.CurrentTailnet.Name
+	profile, _, err := s.lc.ProfileStatus(r.Context())
+	if err != nil {
+		s.logf("error fetching profiles: %v", err)
+		// If for some reason we can't fetch profiles,
+		// continue to use st.CurrentTailnet if set.
+		if st.CurrentTailnet != nil {
+			data.TailnetName = st.CurrentTailnet.MagicDNSSuffix
+			data.DomainName = st.CurrentTailnet.Name
+		}
+	} else {
+		data.TailnetName = profile.NetworkProfile.MagicDNSName
+		data.DomainName = profile.NetworkProfile.DisplayNameOrDefault()
 	}
 	if st.Self.Tags != nil {
 		data.Tags = st.Self.Tags.AsSlice()
@@ -983,7 +1053,7 @@ func availableFeatures() map[string]bool {
 		"advertise-routes":    true, // available on all platforms
 		"use-exit-node":       featureknob.CanUseExitNode() == nil,
 		"ssh":                 featureknob.CanRunTailscaleSSH() == nil,
-		"auto-update":         version.IsUnstableBuild() && clientupdate.CanAutoUpdate(),
+		"auto-update":         version.IsUnstableBuild() && feature.CanAutoUpdate(),
 	}
 	return features
 }
@@ -1273,37 +1343,6 @@ func (s *Server) proxyRequestToLocalAPI(w http.ResponseWriter, r *http.Request) 
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
-}
-
-// csrfKey returns a key that can be used for CSRF protection.
-// If an error occurs during key creation, the error is logged and the active process terminated.
-// If the server is running in CGI mode, the key is cached to disk and reused between requests.
-// If an error occurs during key storage, the error is logged and the active process terminated.
-func (s *Server) csrfKey() []byte {
-	csrfFile := filepath.Join(os.TempDir(), "tailscale-web-csrf.key")
-
-	// if running in CGI mode, try to read from disk, but ignore errors
-	if s.cgiMode {
-		key, _ := os.ReadFile(csrfFile)
-		if len(key) == 32 {
-			return key
-		}
-	}
-
-	// create a new key
-	key := make([]byte, 32)
-	if _, err := rand.Read(key); err != nil {
-		log.Fatalf("error generating CSRF key: %v", err)
-	}
-
-	// if running in CGI mode, try to write the newly created key to disk, and exit if it fails.
-	if s.cgiMode {
-		if err := os.WriteFile(csrfFile, key, 0o600); err != nil {
-			log.Fatalf("unable to store CSRF key: %v", err)
-		}
-	}
-
-	return key
 }
 
 // enforcePrefix returns a HandlerFunc that enforces a given path prefix is used in requests,

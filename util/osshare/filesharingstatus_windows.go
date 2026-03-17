@@ -8,9 +8,11 @@ package osshare
 import (
 	"os"
 	"path/filepath"
-	"sync"
+	"runtime"
 
+	"github.com/sagernet/tailscale/types/lazy"
 	"github.com/sagernet/tailscale/types/logger"
+	"github.com/sagernet/tailscale/util/winutil"
 	"golang.org/x/sys/windows/registry"
 )
 
@@ -18,20 +20,19 @@ const (
 	sendFileShellKey = `*\shell\tailscale`
 )
 
-var ipnExePath struct {
-	sync.Mutex
-	cache string // absolute path of tailscale-ipn.exe, populated lazily on first use
-}
+var ipnExePath lazy.SyncValue[string] // absolute path of the GUI executable
 
 func getIpnExePath(logf logger.Logf) string {
-	ipnExePath.Lock()
-	defer ipnExePath.Unlock()
-
-	if ipnExePath.cache != "" {
-		return ipnExePath.cache
+	exe, err := winutil.GUIPathFromReg()
+	if err == nil {
+		return exe
 	}
 
-	// Find the absolute path of tailscale-ipn.exe assuming that it's in the same
+	return findGUIInSameDirAsThisExe(logf)
+}
+
+func findGUIInSameDirAsThisExe(logf logger.Logf) string {
+	// Find the absolute path of the GUI, assuming that it's in the same
 	// directory as this executable (tailscaled.exe).
 	p, err := os.Executable()
 	if err != nil {
@@ -42,14 +43,23 @@ func getIpnExePath(logf logger.Logf) string {
 		logf("filepath.EvalSymlinks error: %v", err)
 		return ""
 	}
-	p = filepath.Join(filepath.Dir(p), "tailscale-ipn.exe")
 	if p, err = filepath.Abs(p); err != nil {
 		logf("filepath.Abs error: %v", err)
 		return ""
 	}
-	ipnExePath.cache = p
-
-	return p
+	d := filepath.Dir(p)
+	candidates := []string{"tailscale-ipn.exe"}
+	if runtime.GOARCH == "arm64" {
+		// This name may be used on Windows 10 ARM64.
+		candidates = append(candidates, "tailscale-gui-386.exe")
+	}
+	for _, c := range candidates {
+		testPath := filepath.Join(d, c)
+		if _, err := os.Stat(testPath); err == nil {
+			return testPath
+		}
+	}
+	return ""
 }
 
 // SetFileSharingEnabled adds/removes "Send with Tailscale" from the Windows shell menu.
@@ -63,7 +73,9 @@ func SetFileSharingEnabled(enabled bool, logf logger.Logf) {
 }
 
 func enableFileSharing(logf logger.Logf) {
-	path := getIpnExePath(logf)
+	path := ipnExePath.Get(func() string {
+		return getIpnExePath(logf)
+	})
 	if path == "" {
 		return
 	}
@@ -78,7 +90,7 @@ func enableFileSharing(logf logger.Logf) {
 		logf("k.SetStringValue error: %v", err)
 		return
 	}
-	if err := k.SetStringValue("Icon", path+",0"); err != nil {
+	if err := k.SetStringValue("Icon", path+",1"); err != nil {
 		logf("k.SetStringValue error: %v", err)
 		return
 	}

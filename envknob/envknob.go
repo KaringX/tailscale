@@ -28,18 +28,19 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/sagernet/tailscale/feature/buildfeatures"
 	"github.com/sagernet/tailscale/kube/kubetypes"
+	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/types/opt"
 	"github.com/sagernet/tailscale/version"
 	"github.com/sagernet/tailscale/version/distro"
 )
 
 var (
-	mu sync.Mutex
+	mu syncs.Mutex
 	// +checklocks:mu
 	set = map[string]string{}
 	// +checklocks:mu
@@ -417,6 +418,29 @@ func App() string {
 	return ""
 }
 
+// IsCertShareReadOnlyMode returns true if this replica should never attempt to
+// issue or renew TLS credentials for any of the HTTPS endpoints that it is
+// serving. It should only return certs found in its cert store.  Currently,
+// this is used by the Kubernetes Operator's HA Ingress via VIPServices, where
+// multiple Ingress proxy instances serve the same HTTPS endpoint with a shared
+// TLS credentials. The TLS credentials should only be issued by one of the
+// replicas.
+// For HTTPS Ingress the operator and containerboot ensure
+// that read-only replicas will not be serving the HTTPS endpoints before there
+// is a shared cert available.
+func IsCertShareReadOnlyMode() bool {
+	m := String("TS_CERT_SHARE_MODE")
+	return m == "ro"
+}
+
+// IsCertShareReadWriteMode returns true if this instance is the replica
+// responsible for issuing and renewing TLS certs in an HA setup with certs
+// shared between multiple replicas.
+func IsCertShareReadWriteMode() bool {
+	m := String("TS_CERT_SHARE_MODE")
+	return m == "rw"
+}
+
 // CrashOnUnexpected reports whether the Tailscale client should panic
 // on unexpected conditions. If TS_DEBUG_CRASH_ON_UNEXPECTED is set, that's
 // used. Otherwise the default value is true for unstable builds.
@@ -440,7 +464,12 @@ var allowRemoteUpdate = RegisterBool("TS_ALLOW_ADMIN_CONSOLE_REMOTE_UPDATE")
 // AllowsRemoteUpdate reports whether this node has opted-in to letting the
 // Tailscale control plane initiate a Tailscale update (e.g. on behalf of an
 // admin on the admin console).
-func AllowsRemoteUpdate() bool { return allowRemoteUpdate() }
+func AllowsRemoteUpdate() bool {
+	if !buildfeatures.HasClientUpdate {
+		return false
+	}
+	return allowRemoteUpdate()
+}
 
 // SetNoLogsNoSupport enables no-logs-no-support mode.
 func SetNoLogsNoSupport() {
@@ -451,6 +480,9 @@ func SetNoLogsNoSupport() {
 var notInInit atomic.Bool
 
 func assertNotInInit() {
+	if !buildfeatures.HasDebug {
+		return
+	}
 	if notInInit.Load() {
 		return
 	}
@@ -510,6 +542,11 @@ func ApplyDiskConfigError() error { return applyDiskConfigErr }
 //     for App Store builds
 //   - /etc/tailscale/tailscaled-env.txt for tailscaled-on-macOS (homebrew, etc)
 func ApplyDiskConfig() (err error) {
+	if runtime.GOOS == "linux" && !(buildfeatures.HasDebug || buildfeatures.HasSynology) {
+		// This function does nothing on Linux, unless you're
+		// using TS_DEBUG_ENV_FILE or are on Synology.
+		return nil
+	}
 	var f *os.File
 	defer func() {
 		if err != nil {
@@ -570,7 +607,7 @@ func getPlatformEnvFiles() []string {
 			filepath.Join(os.Getenv("ProgramData"), "Tailscale", "tailscaled-env.txt"),
 		}
 	case "linux":
-		if distro.Get() == distro.Synology {
+		if buildfeatures.HasSynology && distro.Get() == distro.Synology {
 			return []string{"/etc/tailscale/tailscaled-env.txt"}
 		}
 	case "darwin":

@@ -8,7 +8,6 @@ package wgcfg
 import (
 	"net/netip"
 
-	"github.com/sagernet/tailscale/tailcfg"
 	"github.com/sagernet/tailscale/types/key"
 	"github.com/sagernet/tailscale/types/logid"
 	"github.com/sagernet/tailscale/types/ptr"
@@ -35,8 +34,6 @@ func (src *Config) Clone() *Config {
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _ConfigCloneNeedsRegeneration = Config(struct {
-	Name           string
-	NodeID         tailcfg.StableNodeID
 	PrivateKey     key.NodePrivate
 	Addresses      []netip.Prefix
 	MTU            uint16

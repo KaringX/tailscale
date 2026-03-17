@@ -12,6 +12,7 @@ import (
 
 	"github.com/sagernet/tailscale/net/tsaddr"
 	"github.com/sagernet/tailscale/types/logger"
+	"github.com/sagernet/tailscale/util/eventbus"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
 
@@ -43,7 +44,7 @@ type winMon struct {
 	noDeadlockTicker *time.Ticker
 }
 
-func newOSMon(logf logger.Logf, pm *Monitor) (osMon, error) {
+func newOSMon(_ *eventbus.Bus, logf logger.Logf, pm *Monitor) (osMon, error) {
 	m := &winMon{
 		logf:             logf,
 		isActive:         pm.isActive,

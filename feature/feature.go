@@ -4,9 +4,22 @@
 // Package feature tracks which features are linked into the binary.
 package feature
 
-import "reflect"
+import (
+	"errors"
+	"reflect"
+
+	"github.com/sagernet/tailscale/util/testenv"
+)
+
+var ErrUnavailable = errors.New("feature not included in this build")
 
 var in = map[string]bool{}
+
+// Registered reports the set of registered features.
+//
+// The returned map should not be modified by the caller,
+// not accessed concurrently with calls to Register.
+func Registered() map[string]bool { return in }
 
 // Register notes that the named feature is linked into the binary.
 func Register(name string) {
@@ -44,11 +57,54 @@ func (h *Hook[Func]) Set(f Func) {
 	h.ok = true
 }
 
+// SetForTest sets the hook function for tests, blowing
+// away any previous value. It will panic if called from
+// non-test code.
+//
+// It returns a restore function that resets the hook
+// to its previous value.
+func (h *Hook[Func]) SetForTest(f Func) (restore func()) {
+	testenv.AssertInTest()
+	old := *h
+	h.f, h.ok = f, true
+	return func() { *h = old }
+}
+
 // Get returns the hook function, or panics if it hasn't been set.
-// Use IsSet to check if it's been set.
+// Use IsSet to check if it's been set, or use GetOrNil if you're
+// okay with a nil return value.
 func (h *Hook[Func]) Get() Func {
 	if !h.ok {
 		panic("Get on unset feature hook, without IsSet")
 	}
 	return h.f
+}
+
+// GetOk returns the hook function and true if it has been set,
+// otherwise its zero value and false.
+func (h *Hook[Func]) GetOk() (f Func, ok bool) {
+	return h.f, h.ok
+}
+
+// GetOrNil returns the hook function or nil if it hasn't been set.
+func (h *Hook[Func]) GetOrNil() Func {
+	return h.f
+}
+
+// Hooks is a slice of funcs.
+//
+// As opposed to a single Hook, this is meant to be used when
+// multiple parties are able to install the same hook.
+type Hooks[Func any] []Func
+
+// Add adds a hook to the list of hooks.
+//
+// Add should only be called during early program
+// startup before Tailscale has started.
+// It is not safe for concurrent use.
+func (h *Hooks[Func]) Add(f Func) {
+	if reflect.ValueOf(f).IsZero() {
+		panic("Add with zero value")
+	}
+	*h = append(*h, f)
 }

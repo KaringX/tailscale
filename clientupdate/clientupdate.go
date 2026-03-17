@@ -27,6 +27,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/sagernet/tailscale/feature"
+	"github.com/sagernet/tailscale/hostinfo"
+	"github.com/sagernet/tailscale/types/lazy"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/util/cmpver"
 	"github.com/sagernet/tailscale/version"
@@ -169,6 +172,12 @@ func NewUpdater(args Arguments) (*Updater, error) {
 type updateFunction func() error
 
 func (up *Updater) getUpdateFunction() (fn updateFunction, canAutoUpdate bool) {
+	hi := hostinfo.New()
+	// We don't know how to update custom tsnet binaries, it's up to the user.
+	if hi.Package == "tsnet" {
+		return nil, false
+	}
+
 	switch runtime.GOOS {
 	case "windows":
 		return up.updateWindows, true
@@ -242,9 +251,17 @@ func (up *Updater) getUpdateFunction() (fn updateFunction, canAutoUpdate bool) {
 	return nil, false
 }
 
-// CanAutoUpdate reports whether auto-updating via the clientupdate package
+var canAutoUpdateCache lazy.SyncValue[bool]
+
+func init() {
+	feature.HookCanAutoUpdate.Set(canAutoUpdate)
+}
+
+// canAutoUpdate reports whether auto-updating via the clientupdate package
 // is supported for the current os/distro.
-func CanAutoUpdate() bool {
+func canAutoUpdate() bool { return canAutoUpdateCache.Get(canAutoUpdateUncached) }
+
+func canAutoUpdateUncached() bool {
 	if version.IsMacSysExt() {
 		// Macsys uses Sparkle for auto-updates, which doesn't have an update
 		// function in this package.
@@ -401,13 +418,13 @@ func parseSynoinfo(path string) (string, error) {
 	// Extract the CPU in the middle (88f6282 in the above example).
 	s := bufio.NewScanner(f)
 	for s.Scan() {
-		l := s.Text()
-		if !strings.HasPrefix(l, "unique=") {
+		line := s.Text()
+		if !strings.HasPrefix(line, "unique=") {
 			continue
 		}
-		parts := strings.SplitN(l, "_", 3)
+		parts := strings.SplitN(line, "_", 3)
 		if len(parts) != 3 {
-			return "", fmt.Errorf(`malformed %q: found %q, expected format like 'unique="synology_$cpu_$model'`, path, l)
+			return "", fmt.Errorf(`malformed %q: found %q, expected format like 'unique="synology_$cpu_$model'`, path, line)
 		}
 		return parts[1], nil
 	}

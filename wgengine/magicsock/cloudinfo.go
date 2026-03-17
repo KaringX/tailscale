@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sagernet/tailscale/feature/buildfeatures"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/util/cloudenv"
 )
@@ -34,6 +35,9 @@ type cloudInfo struct {
 }
 
 func newCloudInfo(logf logger.Logf) *cloudInfo {
+	if !buildfeatures.HasCloud {
+		return nil
+	}
 	tr := &http.Transport{
 		DisableKeepAlives: true,
 		Dial: (&net.Dialer{
@@ -53,6 +57,9 @@ func newCloudInfo(logf logger.Logf) *cloudInfo {
 // if the tailscaled process is running in a known cloud and there are any such
 // IPs present.
 func (ci *cloudInfo) GetPublicIPs(ctx context.Context) ([]netip.Addr, error) {
+	if !buildfeatures.HasCloud {
+		return nil, nil
+	}
 	switch ci.cloud {
 	case cloudenv.AWS:
 		ret, err := ci.getAWS(ctx)

@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -25,13 +26,17 @@ import (
 
 	"github.com/sagernet/tailscale/control/controlknobs"
 	"github.com/sagernet/tailscale/envknob"
+	"github.com/sagernet/tailscale/feature"
+	"github.com/sagernet/tailscale/feature/buildfeatures"
 	"github.com/sagernet/tailscale/health"
 	"github.com/sagernet/tailscale/net/dns/publicdns"
 	"github.com/sagernet/tailscale/net/dnscache"
 	"github.com/sagernet/tailscale/net/neterror"
 	"github.com/sagernet/tailscale/net/netmon"
+	"github.com/sagernet/tailscale/net/netx"
 	"github.com/sagernet/tailscale/net/sockstats"
 	"github.com/sagernet/tailscale/net/tsdial"
+	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/types/dnstype"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/types/nettype"
@@ -215,18 +220,19 @@ type resolverAndDelay struct {
 
 // forwarder forwards DNS packets to a number of upstream nameservers.
 type forwarder struct {
-	logf    logger.Logf
-	netMon  *netmon.Monitor     // always non-nil
-	linkSel ForwardLinkSelector // TODO(bradfitz): remove this when tsdial.Dialer absorbs it
-	dialer  *tsdial.Dialer
-	health  *health.Tracker // always non-nil
+	logf       logger.Logf
+	netMon     *netmon.Monitor     // always non-nil
+	linkSel    ForwardLinkSelector // TODO(bradfitz): remove this when tsdial.Dialer absorbs it
+	dialer     *tsdial.Dialer
+	health     *health.Tracker // always non-nil
+	verboseFwd bool            // if true, log all DNS forwarding
 
 	controlKnobs *controlknobs.Knobs // or nil
 
 	ctx       context.Context    // good until Close
 	ctxCancel context.CancelFunc // closes ctx
 
-	mu sync.Mutex // guards following
+	mu syncs.Mutex // guards following
 
 	dohClient map[string]*http.Client // urlBase -> client
 
@@ -243,26 +249,23 @@ type forwarder struct {
 	// /etc/resolv.conf is missing/corrupt, and the peerapi ExitDNS stub
 	// resolver lookup.
 	cloudHostFallback []resolverAndDelay
-
-	// missingUpstreamRecovery, if non-nil, is set called when a SERVFAIL is
-	// returned due to missing upstream resolvers.
-	//
-	// This should attempt to properly (re)set the upstream resolvers.
-	missingUpstreamRecovery func()
 }
 
 func newForwarder(logf logger.Logf, netMon *netmon.Monitor, linkSel ForwardLinkSelector, dialer *tsdial.Dialer, health *health.Tracker, knobs *controlknobs.Knobs) *forwarder {
+	if !buildfeatures.HasDNS {
+		return nil
+	}
 	if netMon == nil {
 		panic("nil netMon")
 	}
 	f := &forwarder{
-		logf:                    logger.WithPrefix(logf, "forward: "),
-		netMon:                  netMon,
-		linkSel:                 linkSel,
-		dialer:                  dialer,
-		health:                  health,
-		controlKnobs:            knobs,
-		missingUpstreamRecovery: func() {},
+		logf:         logger.WithPrefix(logf, "forward: "),
+		netMon:       netMon,
+		linkSel:      linkSel,
+		dialer:       dialer,
+		health:       health,
+		controlKnobs: knobs,
+		verboseFwd:   verboseDNSForward(),
 	}
 	f.ctx, f.ctxCancel = context.WithCancel(context.Background())
 	return f
@@ -520,7 +523,7 @@ var (
 //
 // send expects the reply to have the same txid as txidOut.
 func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDelay) (ret []byte, err error) {
-	if verboseDNSForward() {
+	if f.verboseFwd {
 		id := forwarderCount.Add(1)
 		domain, typ, _ := nameFromQuery(fq.packet)
 		f.logf("forwarder.send(%q, %d, %v, %d) [%d] ...", rr.name.Addr, fq.txid, typ, len(domain), id)
@@ -529,6 +532,9 @@ func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDe
 		}()
 	}
 	if strings.HasPrefix(rr.name.Addr, "http://") {
+		if !buildfeatures.HasPeerAPIClient {
+			return nil, feature.ErrUnavailable
+		}
 		return f.sendDoH(ctx, rr.name.Addr, f.dialer.PeerAPIHTTPClient(), fq.packet)
 	}
 	if strings.HasPrefix(rr.name.Addr, "https://") {
@@ -741,18 +747,38 @@ func (f *forwarder) sendUDP(ctx context.Context, fq *forwardQuery, rr resolverAn
 	return out, nil
 }
 
-func (f *forwarder) getDialerType() dnscache.DialContextFunc {
-	if f.controlKnobs != nil && f.controlKnobs.UserDialUseRoutes.Load() {
-		// It is safe to use UserDial as it dials external servers without going through Tailscale
-		// and closes connections on interface change in the same way as SystemDial does,
-		// thus preventing DNS resolution issues when switching between WiFi and cellular,
-		// but can also dial an internal DNS server on the Tailnet or via a subnet router.
-		//
-		// TODO(nickkhyl): Update tsdial.Dialer to reuse the bart.Table we create in net/tstun.Wrapper
-		// to avoid having two bart tables in memory, especially on iOS. Once that's done,
-		// we can get rid of the nodeAttr/control knob and always use UserDial for DNS.
-		//
-		// See https://github.com/tailscale/tailscale/issues/12027.
+var optDNSForwardUseRoutes = envknob.RegisterOptBool("TS_DEBUG_DNS_FORWARD_USE_ROUTES")
+
+// ShouldUseRoutes reports whether the DNS resolver should consider routes when dialing
+// upstream nameservers via TCP.
+//
+// If true, routes should be considered ([tsdial.Dialer.UserDial]), otherwise defer
+// to the system routes ([tsdial.Dialer.SystemDial]).
+//
+// TODO(nickkhyl): Update [tsdial.Dialer] to reuse the bart.Table we create in net/tstun.Wrapper
+// to avoid having two bart tables in memory, especially on iOS. Once that's done,
+// we can get rid of the nodeAttr/control knob and always use UserDial for DNS.
+//
+// See tailscale/tailscale#12027.
+func ShouldUseRoutes(knobs *controlknobs.Knobs) bool {
+	if !buildfeatures.HasDNS {
+		return false
+	}
+	switch runtime.GOOS {
+	case "android", "ios":
+		// On mobile platforms with lower memory limits (e.g., 50MB on iOS),
+		// this behavior is still gated by the "user-dial-routes" nodeAttr.
+		return knobs != nil && knobs.UserDialUseRoutes.Load()
+	default:
+		// On all other platforms, it is the default behavior,
+		// but it can be overridden with the "TS_DEBUG_DNS_FORWARD_USE_ROUTES" env var.
+		doNotUseRoutes := optDNSForwardUseRoutes().EqualBool(false)
+		return !doNotUseRoutes
+	}
+}
+
+func (f *forwarder) getDialerType() netx.DialFunc {
+	if ShouldUseRoutes(f.controlKnobs) {
 		return f.dialer.UserDial
 	}
 	return f.dialer.SystemDial
@@ -945,13 +971,6 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 			f.health.SetUnhealthy(dnsForwarderFailing, health.Args{health.ArgDNSServers: ""})
 			f.logf("no upstream resolvers set, returning SERVFAIL")
 
-			// Attempt to recompile the DNS configuration
-			// If we are being asked to forward queries and we have no
-			// nameservers, the network is in a bad state.
-			if f.missingUpstreamRecovery != nil {
-				f.missingUpstreamRecovery()
-			}
-
 			res, err := servfailResponse(query)
 			if err != nil {
 				return err
@@ -975,7 +994,7 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 	}
 	defer fq.closeOnCtxDone.Close()
 
-	if verboseDNSForward() {
+	if f.verboseFwd {
 		domainSha256 := sha256.Sum256([]byte(domain))
 		domainSig := base64.RawStdEncoding.EncodeToString(domainSha256[:3])
 		f.logf("request(%d, %v, %d, %s) %d...", fq.txid, typ, len(domain), domainSig, len(fq.packet))
@@ -1020,7 +1039,7 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 				metricDNSFwdErrorContext.Add(1)
 				return fmt.Errorf("waiting to send response: %w", ctx.Err())
 			case responseChan <- packet{v, query.family, query.addr}:
-				if verboseDNSForward() {
+				if f.verboseFwd {
 					f.logf("response(%d, %v, %d) = %d, nil", fq.txid, typ, len(domain), len(v))
 				}
 				metricDNSFwdSuccess.Add(1)
@@ -1050,7 +1069,7 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 						}
 						f.health.SetUnhealthy(dnsForwarderFailing, health.Args{health.ArgDNSServers: strings.Join(resolverAddrs, ",")})
 					case responseChan <- res:
-						if verboseDNSForward() {
+						if f.verboseFwd {
 							f.logf("forwarder response(%d, %v, %d) = %d, %v", fq.txid, typ, len(domain), len(res.bs), firstErr)
 						}
 						return nil

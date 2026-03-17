@@ -13,7 +13,6 @@ import (
 	"github.com/sagernet/tailscale/net/stun"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/types/nettype"
-	"github.com/sagernet/tailscale/util/multierr"
 )
 
 // Standalone creates the necessary UDP sockets on the given bindAddr and starts
@@ -62,7 +61,7 @@ func (c *Client) Standalone(ctx context.Context, bindAddr string) error {
 
 	// If both v4 and v6 failed, report an error, otherwise let one succeed.
 	if len(errs) == 2 {
-		return multierr.New(errs...)
+		return errors.Join(errs...)
 	}
 	return nil
 }

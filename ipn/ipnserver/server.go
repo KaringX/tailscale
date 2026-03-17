@@ -7,6 +7,7 @@ package ipnserver
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,22 +15,26 @@ import (
 	"net"
 	"net/http"
 	"os/user"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"unicode"
 
+	"github.com/sagernet/tailscale/client/tailscale/apitype"
 	"github.com/sagernet/tailscale/envknob"
+	"github.com/sagernet/tailscale/feature"
+	"github.com/sagernet/tailscale/feature/buildfeatures"
 	"github.com/sagernet/tailscale/ipn/ipnauth"
 	"github.com/sagernet/tailscale/ipn/ipnlocal"
 	"github.com/sagernet/tailscale/ipn/localapi"
 	"github.com/sagernet/tailscale/net/netmon"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/types/logid"
+	"github.com/sagernet/tailscale/util/eventbus"
 	"github.com/sagernet/tailscale/util/mak"
 	"github.com/sagernet/tailscale/util/set"
-	"github.com/sagernet/tailscale/util/systemd"
 	"github.com/sagernet/tailscale/util/testenv"
 )
 
@@ -38,14 +43,9 @@ import (
 type Server struct {
 	lb           atomic.Pointer[ipnlocal.LocalBackend]
 	logf         logger.Logf
+	bus          *eventbus.Bus
 	netMon       *netmon.Monitor // must be non-nil
 	backendLogID logid.PublicID
-	// resetOnZero is whether to call bs.Reset on transition from
-	// 1->0 active HTTP requests. That is, this is whether the backend is
-	// being run in "client mode" that requires an active GUI
-	// connection (such as on Windows by default). Even if this
-	// is true, the ForceDaemon pref can override this.
-	resetOnZero bool
 
 	// mu guards the fields that follow.
 	// lock order: mu, then LocalBackend.mu
@@ -122,6 +122,10 @@ func (s *Server) awaitBackend(ctx context.Context) (_ *ipnlocal.LocalBackend, ok
 // This is primarily for the Windows GUI, because wintun can take awhile to
 // come up. See https://github.com/tailscale/tailscale/issues/6522.
 func (s *Server) serveServerStatus(w http.ResponseWriter, r *http.Request) {
+	if !buildfeatures.HasDebug && runtime.GOOS != "windows" {
+		http.Error(w, feature.ErrUnavailable.Error(), http.StatusNotFound)
+		return
+	}
 	ctx := r.Context()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -194,14 +198,29 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	defer onDone()
 
 	if strings.HasPrefix(r.URL.Path, "/localapi/") {
-		lah := localapi.NewHandler(lb, s.logf, s.backendLogID, s.netMon.Dialer())
+		if actor, ok := ci.(*actor); ok {
+			reason, err := base64.StdEncoding.DecodeString(r.Header.Get(apitype.RequestReasonHeader))
+			if err != nil {
+				http.Error(w, "invalid reason header", http.StatusBadRequest)
+				return
+			}
+			ci = actorWithAccessOverride(actor, string(reason))
+		}
+
+		lah := localapi.NewHandler(localapi.HandlerConfig{
+			Actor:    ci,
+			Backend:  lb,
+			Logf:     s.logf,
+			LogID:    s.backendLogID,
+			EventBus: lb.Sys().Bus.Get(),
+			Dialer:   s.netMon.Dialer(),
+		})
 		if actor, ok := ci.(*actor); ok {
 			lah.PermitRead, lah.PermitWrite = actor.Permissions(lb.OperatorUserID())
 			lah.PermitCert = actor.CanFetchCerts()
 		} else if testenv.InTest() {
 			lah.PermitRead, lah.PermitWrite = true, true
 		}
-		lah.Actor = ci
 		lah.ServeHTTP(w, r)
 		return
 	}
@@ -308,6 +327,13 @@ func (s *Server) blockWhileIdentityInUse(ctx context.Context, actor ipnauth.Acto
 // Unix-like platforms and specifies the ID of a local user
 // (in the os/user.User.Uid string form) who is allowed
 // to operate tailscaled without being root or using sudo.
+//
+// Sandboxed macos clients must directly supply, or be able to read,
+// an explicit token. Permission is inferred by validating that
+// token. Sandboxed macos clients also don't use ipnserver.actor at all
+// (and prior to that, they didn't use ipnauth.ConnIdentity)
+//
+// See safesocket and safesocket_darwin.
 func (a *actor) Permissions(operatorUID string) (read, write bool) {
 	switch envknob.GOOS() {
 	case "windows":
@@ -320,7 +346,7 @@ func (a *actor) Permissions(operatorUID string) (read, write bool) {
 		// checks here. Note that this permission model is being changed in
 		// tailscale/corp#18342.
 		return true, true
-	case "js":
+	case "js", "plan9":
 		return true, true
 	}
 	if a.ci.IsUnixSock() {
@@ -363,6 +389,9 @@ func isAllDigit(s string) bool {
 // connection. It's intended to give your non-root webserver access
 // (www-data, caddy, nginx, etc) to certs.
 func (a *actor) CanFetchCerts() bool {
+	if !buildfeatures.HasACME {
+		return false
+	}
 	if a.ci.IsUnixSock() && a.ci.Creds() != nil {
 		connUID, ok := a.ci.Creds().UserID()
 		if ok && connUID == userIDFromString(envknob.String("TS_PERMIT_CERT_UID")) {
@@ -379,6 +408,10 @@ func (a *actor) CanFetchCerts() bool {
 //
 // onDone must be called when the HTTP request is done.
 func (s *Server) addActiveHTTPRequest(req *http.Request, actor ipnauth.Actor) (onDone func(), err error) {
+	if runtime.GOOS != "windows" && !buildfeatures.HasUnixSocketIdentity {
+		return func() {}, nil
+	}
+
 	if actor == nil {
 		return nil, errors.New("internal error: nil actor")
 	}
@@ -412,13 +445,8 @@ func (s *Server) addActiveHTTPRequest(req *http.Request, actor ipnauth.Actor) (o
 			return
 		}
 
-		if s.resetOnZero {
-			if lb.InServerMode() {
-				s.logf("client disconnected; staying alive in server mode")
-			} else {
-				s.logf("client disconnected; stopping server")
-				lb.ResetForClientDisconnect()
-			}
+		if envknob.GOOS() == "windows" && !actor.IsLocalSystem() {
+			lb.SetCurrentUser(nil)
 		}
 
 		// Wake up callers waiting for the server to be idle:
@@ -434,15 +462,15 @@ func (s *Server) addActiveHTTPRequest(req *http.Request, actor ipnauth.Actor) (o
 //
 // At some point, either before or after Run, the Server's SetLocalBackend
 // method must also be called before Server can do anything useful.
-func New(logf logger.Logf, logID logid.PublicID, netMon *netmon.Monitor) *Server {
+func New(logf logger.Logf, logID logid.PublicID, bus *eventbus.Bus, netMon *netmon.Monitor) *Server {
 	if netMon == nil {
 		panic("nil netMon")
 	}
 	return &Server{
 		backendLogID: logID,
 		logf:         logf,
+		bus:          bus,
 		netMon:       netMon,
-		resetOnZero:  envknob.GOOS() == "windows",
 	}
 }
 
@@ -483,17 +511,25 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 	runDone := make(chan struct{})
 	defer close(runDone)
 
-	// When the context is closed or when we return, whichever is first, close our listener
+	ec := s.bus.Client("ipnserver.Server")
+	defer ec.Close()
+	shutdownSub := eventbus.Subscribe[localapi.Shutdown](ec)
+
+	// When the context is closed, a [localapi.Shutdown] event is received,
+	// or when we return, whichever is first, close our listener
 	// and all open connections.
 	go func() {
 		select {
+		case <-shutdownSub.Events():
 		case <-ctx.Done():
 		case <-runDone:
 		}
 		ln.Close()
 	}()
 
-	systemd.Ready()
+	if ready, ok := feature.HookSystemdReady.GetOk(); ok {
+		ready()
+	}
 
 	hs := &http.Server{
 		Handler:     http.HandlerFunc(s.serveHTTP),
@@ -516,6 +552,10 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 // Windows and via $DEBUG_LISTENER/debug/ipn when tailscaled's --debug flag
 // is used to run a debug server.
 func (s *Server) ServeHTMLStatus(w http.ResponseWriter, r *http.Request) {
+	if !buildfeatures.HasDebug {
+		http.Error(w, feature.ErrUnavailable.Error(), http.StatusNotFound)
+		return
+	}
 	lb := s.lb.Load()
 	if lb == nil {
 		http.Error(w, "no LocalBackend", http.StatusServiceUnavailable)

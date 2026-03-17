@@ -15,12 +15,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/sagernet/tailscale/envknob"
 	"github.com/sagernet/tailscale/util/ctxkey"
+	"github.com/sagernet/tailscale/util/testenv"
 	"go4.org/mem"
 )
 
@@ -158,6 +160,10 @@ func RateLimitedFn(logf Logf, f time.Duration, burst int, maxCache int) Logf {
 // rate limits.
 func RateLimitedFnWithClock(logf Logf, f time.Duration, burst int, maxCache int, timeNow func() time.Time) Logf {
 	if envknob.String("TS_DEBUG_LOG_RATE") == "all" {
+		return logf
+	}
+	if runtime.GOOS == "plan9" {
+		// To ease bring-up.
 		return logf
 	}
 	var (
@@ -315,6 +321,7 @@ func (fn ArgWriter) Format(f fmt.State, _ rune) {
 	bw.Reset(f)
 	fn(bw)
 	bw.Flush()
+	bw.Reset(io.Discard)
 	argBufioPool.Put(bw)
 }
 
@@ -377,16 +384,10 @@ func (a asJSONResult) Format(s fmt.State, verb rune) {
 	s.Write(v)
 }
 
-// TBLogger is the testing.TB subset needed by TestLogger.
-type TBLogger interface {
-	Helper()
-	Logf(format string, args ...any)
-}
-
 // TestLogger returns a logger that logs to tb.Logf
 // with a prefix to make it easier to distinguish spam
 // from explicit test failures.
-func TestLogger(tb TBLogger) Logf {
+func TestLogger(tb testenv.TB) Logf {
 	return func(format string, args ...any) {
 		tb.Helper()
 		tb.Logf("    ... "+format, args...)

@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+
+	"github.com/sagernet/tailscale/health"
 )
 
 // ErrStateNotExist is returned by StateStore.ReadState when the
@@ -59,6 +61,19 @@ const (
 	// Any non-empty value indicates that at least one file has been received.
 	TaildropReceivedKey = StateKey("_taildrop-received")
 )
+
+// StateStoreHealth is a Warnable set when store.New fails at startup. If
+// unhealthy, we block all login attempts and return a health message in status
+// responses.
+var StateStoreHealth = health.Register(&health.Warnable{
+	Code:     "state-store-health",
+	Severity: health.SeverityHigh,
+	Title:    "Tailscale state store failed to initialize",
+	Text: func(args health.Args) string {
+		return fmt.Sprintf("State store failed to initialize, Tailscale will not work until this is resolved. See https://tailscale.com/s/state-store-init-error. Error: %s", args[health.ArgError])
+	},
+	ImpactsConnectivity: true,
+})
 
 // CurrentProfileID returns the StateKey that stores the
 // current profile ID. The value is a JSON-encoded LoginProfile.
@@ -112,4 +127,10 @@ func ReadStoreInt(store StateStore, id StateKey) (int64, error) {
 // PutStoreInt puts an integer into a StateStore.
 func PutStoreInt(store StateStore, id StateKey, val int64) error {
 	return WriteState(store, id, fmt.Appendf(nil, "%d", val))
+}
+
+// EncryptedStateStore is a marker interface implemented by StateStores that
+// encrypt data at rest.
+type EncryptedStateStore interface {
+	stateStoreIsEncrypted()
 }

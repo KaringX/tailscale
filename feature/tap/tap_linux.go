@@ -6,6 +6,7 @@ package tap
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -27,7 +28,6 @@ import (
 	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/types/ipproto"
 	"github.com/sagernet/tailscale/types/logger"
-	"github.com/sagernet/tailscale/util/multierr"
 	"github.com/sagernet/wireguard-go/tun"
 	"golang.org/x/sys/unix"
 )
@@ -481,7 +481,7 @@ func (t *tapDevice) Write(buffs [][]byte, offset int) (int, error) {
 			wrote++
 		}
 	}
-	return wrote, multierr.New(errs...)
+	return wrote, errors.Join(errs...)
 }
 
 func (t *tapDevice) MTU() (int, error) {

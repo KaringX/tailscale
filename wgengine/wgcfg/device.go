@@ -5,11 +5,11 @@ package wgcfg
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sort"
 
 	"github.com/sagernet/tailscale/types/logger"
-	"github.com/sagernet/tailscale/util/multierr"
 	"github.com/sagernet/wireguard-go/conn"
 	"github.com/sagernet/wireguard-go/device"
 	"github.com/sagernet/wireguard-go/tun"
@@ -35,7 +35,7 @@ func DeviceConfig(d *device.Device) (*Config, error) {
 	cfg, fromErr := FromUAPI(r)
 	r.Close()
 	getErr := <-errc
-	err := multierr.New(getErr, fromErr)
+	err := errors.Join(getErr, fromErr)
 	if err != nil {
 		return nil, err
 	}
@@ -68,5 +68,5 @@ func ReconfigDevice(d *device.Device, cfg *Config, logf logger.Logf) (err error)
 	toErr := cfg.ToUAPI(logf, w, prev)
 	w.Close()
 	setErr := <-errc
-	return multierr.New(setErr, toErr)
+	return errors.Join(setErr, toErr)
 }
