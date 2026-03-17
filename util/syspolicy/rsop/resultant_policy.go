@@ -7,10 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/util/syspolicy/internal/loggerx"
 	"github.com/sagernet/tailscale/util/syspolicy/setting"
 	"github.com/sagernet/tailscale/util/syspolicy/source"
@@ -57,7 +57,7 @@ type Policy struct {
 
 	changeCallbacks policyChangeCallbacks
 
-	mu             sync.Mutex
+	mu             syncs.Mutex
 	watcherStarted bool // whether [Policy.watchReload] was started
 	sources        source.ReadableSources
 	closing        bool // whether [Policy.Close] was called (even if we're still closing)

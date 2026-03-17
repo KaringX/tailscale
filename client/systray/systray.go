@@ -48,7 +48,12 @@ var (
 )
 
 // Run starts the systray menu and blocks until the menu exits.
-func (menu *Menu) Run() {
+// If client is nil, a default local.Client is used.
+func (menu *Menu) Run(client *local.Client) {
+	if client == nil {
+		client = &local.Client{}
+	}
+	menu.lc = client
 	menu.updateState()
 
 	// exit cleanly on SIGINT and SIGTERM
@@ -71,7 +76,7 @@ func (menu *Menu) Run() {
 type Menu struct {
 	mu sync.Mutex // protects the entire Menu
 
-	lc          local.Client
+	lc          *local.Client
 	status      *ipnstate.Status
 	curProfile  ipn.LoginProfile
 	allProfiles []ipn.LoginProfile
@@ -153,8 +158,31 @@ func init() {
 // onReady is called by the systray package when the menu is ready to be built.
 func (menu *Menu) onReady() {
 	log.Printf("starting")
+	if os.Getuid() == 0 || os.Getuid() != os.Geteuid() || os.Getenv("SUDO_USER") != "" || os.Getenv("DOAS_USER") != "" {
+		fmt.Fprintln(os.Stderr, `
+It appears that you might be running the systray with sudo/doas.
+This can lead to issues with D-Bus, and should be avoided.
+
+The systray application should be run with the same user as your desktop session.
+This usually means that you should run the application like:
+
+tailscale systray
+
+See https://tailscale.com/kb/1597/linux-systray for more information.`)
+	}
 	setAppIcon(disconnected)
 	menu.rebuild()
+
+	menu.mu.Lock()
+	if menu.readonly {
+		fmt.Fprintln(os.Stderr, `
+No permission to manage Tailscale. Set operator by running:
+
+sudo tailscale set --operator=$USER
+
+See https://tailscale.com/s/cli-operator for more information.`)
+	}
+	menu.mu.Unlock()
 }
 
 // updateState updates the Menu state from the Tailscale local client.
@@ -290,11 +318,14 @@ func (menu *Menu) rebuild() {
 		menu.rebuildExitNodeMenu(ctx)
 	}
 
-	if menu.status != nil {
-		menu.more = systray.AddMenuItem("More settings", "")
+	menu.more = systray.AddMenuItem("More settings", "")
+	if menu.status != nil && menu.status.BackendState == "Running" {
+		// web client is only available if backend is running
 		onClick(ctx, menu.more, func(_ context.Context) {
 			webbrowser.Open("http://100.100.100.100/")
 		})
+	} else {
+		menu.more.Disable()
 	}
 
 	// TODO(#15528): this menu item shouldn't be necessary at all,
@@ -320,9 +351,9 @@ func profileTitle(profile ipn.LoginProfile) string {
 	if profile.NetworkProfile.DomainName != "" {
 		if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
 			// windows and mac don't support multi-line menu
-			title += " (" + profile.NetworkProfile.DomainName + ")"
+			title += " (" + profile.NetworkProfile.DisplayNameOrDefault() + ")"
 		} else {
-			title += "\n" + profile.NetworkProfile.DomainName
+			title += "\n" + profile.NetworkProfile.DisplayNameOrDefault()
 		}
 	}
 	return title
@@ -481,7 +512,7 @@ func (menu *Menu) watchIPNBus() {
 }
 
 func (menu *Menu) watchIPNBusInner() error {
-	watcher, err := menu.lc.WatchIPNBus(menu.bgCtx, ipn.NotifyNoPrivateKeys)
+	watcher, err := menu.lc.WatchIPNBus(menu.bgCtx, 0)
 	if err != nil {
 		return fmt.Errorf("watching ipn bus: %w", err)
 	}
@@ -521,9 +552,9 @@ func (menu *Menu) copyTailscaleIP(device *ipnstate.PeerStatus) {
 	err := clipboard.WriteAll(ip)
 	if err != nil {
 		log.Printf("clipboard error: %v", err)
+	} else {
+		menu.sendNotification(fmt.Sprintf("Copied Address for %v", name), ip)
 	}
-
-	menu.sendNotification(fmt.Sprintf("Copied Address for %v", name), ip)
 }
 
 // sendNotification sends a desktop notification with the given title and content.

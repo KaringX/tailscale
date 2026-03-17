@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"sync"
 
 	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/util/slicesx"
@@ -20,7 +19,7 @@ import (
 )
 
 var (
-	policyMu          sync.Mutex       // protects [policySources] and [effectivePolicies]
+	policyMu          syncs.Mutex      // protects [policySources] and [effectivePolicies]
 	policySources     []*source.Source // all registered policy sources
 	effectivePolicies []*Policy        // all active (non-closed) effective policies returned by [PolicyFor]
 

@@ -7,6 +7,7 @@
 package prober
 
 import (
+	"bytes"
 	"cmp"
 	"container/ring"
 	"context"
@@ -17,12 +18,14 @@ import (
 	"maps"
 	"math/rand"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/tsweb"
+	"golang.org/x/sync/errgroup"
 )
 
 // recentHistSize is the number of recent probe results and latencies to keep
@@ -115,25 +118,25 @@ func (p *Prober) Run(name string, interval time.Duration, labels Labels, pc Prob
 		panic(fmt.Sprintf("probe named %q already registered", name))
 	}
 
-	l := prometheus.Labels{
+	lb := prometheus.Labels{
 		"name":  name,
 		"class": pc.Class,
 	}
 	for k, v := range pc.Labels {
-		l[k] = v
+		lb[k] = v
 	}
 	for k, v := range labels {
-		l[k] = v
+		lb[k] = v
 	}
 
-	probe := newProbe(p, name, interval, l, pc)
+	probe := newProbe(p, name, interval, lb, pc)
 	p.probes[name] = probe
 	go probe.loop()
 	return probe
 }
 
 // newProbe creates a new Probe with the given parameters, but does not start it.
-func newProbe(p *Prober, name string, interval time.Duration, l prometheus.Labels, pc ProbeClass) *Probe {
+func newProbe(p *Prober, name string, interval time.Duration, lg prometheus.Labels, pc ProbeClass) *Probe {
 	ctx, cancel := context.WithCancel(context.Background())
 	probe := &Probe{
 		prober:  p,
@@ -152,17 +155,17 @@ func newProbe(p *Prober, name string, interval time.Duration, l prometheus.Label
 		latencyHist:  ring.New(recentHistSize),
 
 		metrics:      prometheus.NewRegistry(),
-		metricLabels: l,
-		mInterval:    prometheus.NewDesc("interval_secs", "Probe interval in seconds", nil, l),
-		mStartTime:   prometheus.NewDesc("start_secs", "Latest probe start time (seconds since epoch)", nil, l),
-		mEndTime:     prometheus.NewDesc("end_secs", "Latest probe end time (seconds since epoch)", nil, l),
-		mLatency:     prometheus.NewDesc("latency_millis", "Latest probe latency (ms)", nil, l),
-		mResult:      prometheus.NewDesc("result", "Latest probe result (1 = success, 0 = failure)", nil, l),
+		metricLabels: lg,
+		mInterval:    prometheus.NewDesc("interval_secs", "Probe interval in seconds", nil, lg),
+		mStartTime:   prometheus.NewDesc("start_secs", "Latest probe start time (seconds since epoch)", nil, lg),
+		mEndTime:     prometheus.NewDesc("end_secs", "Latest probe end time (seconds since epoch)", nil, lg),
+		mLatency:     prometheus.NewDesc("latency_millis", "Latest probe latency (ms)", nil, lg),
+		mResult:      prometheus.NewDesc("result", "Latest probe result (1 = success, 0 = failure)", nil, lg),
 		mAttempts: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "attempts_total", Help: "Total number of probing attempts", ConstLabels: l,
+			Name: "attempts_total", Help: "Total number of probing attempts", ConstLabels: lg,
 		}, []string{"status"}),
 		mSeconds: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "seconds_total", Help: "Total amount of time spent executing the probe", ConstLabels: l,
+			Name: "seconds_total", Help: "Total amount of time spent executing the probe", ConstLabels: lg,
 		}, []string{"status"}),
 	}
 	if p.metrics != nil {
@@ -314,7 +317,7 @@ func (p *Probe) loop() {
 			p.run()
 			// Wait and then retry if probe fails. We use the inverse of the
 			// configured negative interval as our sleep period.
-			// TODO(percy):implement exponential backoff, possibly using logtail/backoff.
+			// TODO(percy):implement exponential backoff, possibly using util/backoff.
 			select {
 			case <-time.After(-1 * p.interval):
 				p.run()
@@ -509,8 +512,8 @@ func (probe *Probe) probeInfoLocked() ProbeInfo {
 		inf.Latency = probe.latency
 	}
 	probe.latencyHist.Do(func(v any) {
-		if l, ok := v.(time.Duration); ok {
-			inf.RecentLatencies = append(inf.RecentLatencies, l)
+		if latency, ok := v.(time.Duration); ok {
+			inf.RecentLatencies = append(inf.RecentLatencies, latency)
 		}
 	})
 	probe.successHist.Do(func(v any) {
@@ -567,14 +570,76 @@ func (p *Prober) RunHandler(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	stats := fmt.Sprintf("Last %d probes: success rate %d%%, median latency %v\n",
-		len(prevInfo.RecentResults),
-		int(prevInfo.RecentSuccessRatio()*100), prevInfo.RecentMedianLatency())
+	stats := fmt.Sprintf("Last %d probes (including this one): success rate %d%%, median latency %v\n",
+		len(info.RecentResults),
+		int(info.RecentSuccessRatio()*100), info.RecentMedianLatency())
 	if err != nil {
 		return tsweb.Error(respStatus, fmt.Sprintf("Probe failed: %s\n%s", err.Error(), stats), err)
 	}
 	w.WriteHeader(respStatus)
-	w.Write([]byte(fmt.Sprintf("Probe succeeded in %v\n%s", info.Latency, stats)))
+	fmt.Fprintf(w, "Probe succeeded in %v\n%s", info.Latency, stats)
+	return nil
+}
+
+type RunHandlerAllResponse struct {
+	Results map[string]RunHandlerResponse
+}
+
+func (p *Prober) RunAllHandler(w http.ResponseWriter, r *http.Request) error {
+	excluded := r.URL.Query()["exclude"]
+
+	probes := make(map[string]*Probe)
+	p.mu.Lock()
+	for _, probe := range p.probes {
+		if !probe.IsContinuous() && !slices.Contains(excluded, probe.name) {
+			probes[probe.name] = probe
+		}
+	}
+	p.mu.Unlock()
+
+	// Do not abort running probes just because one of them has failed.
+	g := new(errgroup.Group)
+
+	var resultsMu sync.Mutex
+	results := make(map[string]RunHandlerResponse)
+
+	for name, probe := range probes {
+		g.Go(func() error {
+			probe.mu.Lock()
+			prevInfo := probe.probeInfoLocked()
+			probe.mu.Unlock()
+
+			info, err := probe.run()
+
+			resultsMu.Lock()
+			results[name] = RunHandlerResponse{
+				ProbeInfo:             info,
+				PreviousSuccessRatio:  prevInfo.RecentSuccessRatio(),
+				PreviousMedianLatency: prevInfo.RecentMedianLatency(),
+			}
+			resultsMu.Unlock()
+			return err
+		})
+	}
+
+	respStatus := http.StatusOK
+	if err := g.Wait(); err != nil {
+		respStatus = http.StatusFailedDependency
+	}
+
+	// Return serialized JSON response if the client requested JSON
+	resp := &RunHandlerAllResponse{
+		Results: results,
+	}
+	var b bytes.Buffer
+	if err := json.NewEncoder(&b).Encode(resp); err != nil {
+		return tsweb.Error(http.StatusInternalServerError, "error encoding JSON response", err)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(respStatus)
+	w.Write(b.Bytes())
+
 	return nil
 }
 
@@ -654,8 +719,8 @@ func initialDelay(seed string, interval time.Duration) time.Duration {
 // Labels is a set of metric labels used by a prober.
 type Labels map[string]string
 
-func (l Labels) With(k, v string) Labels {
-	new := maps.Clone(l)
+func (lb Labels) With(k, v string) Labels {
+	new := maps.Clone(lb)
 	new[k] = v
 	return new
 }

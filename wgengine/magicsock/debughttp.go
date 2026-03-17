@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sagernet/tailscale/feature"
+	"github.com/sagernet/tailscale/feature/buildfeatures"
 	"github.com/sagernet/tailscale/tailcfg"
 	"github.com/sagernet/tailscale/tstime/mono"
 	"github.com/sagernet/tailscale/types/key"
@@ -24,6 +26,11 @@ import (
 // /debug/magicsock) or via peerapi to a peer that's owned by the same
 // user (so they can e.g. inspect their phones).
 func (c *Conn) ServeHTTPDebug(w http.ResponseWriter, r *http.Request) {
+	if !buildfeatures.HasDebug {
+		http.Error(w, feature.ErrUnavailable.Error(), http.StatusNotImplemented)
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -152,7 +159,7 @@ func printEndpointHTML(w io.Writer, ep *endpoint) {
 	io.WriteString(w, "<p>Endpoints:</p><ul>")
 	for _, ipp := range eps {
 		s := ep.endpointState[ipp]
-		if ipp == ep.bestAddr.ap && !ep.bestAddr.vni.isSet() {
+		if ipp == ep.bestAddr.ap && !ep.bestAddr.vni.IsSet() {
 			fmt.Fprintf(w, "<li><b>%s</b>: (best)<ul>", ipp)
 		} else {
 			fmt.Fprintf(w, "<li>%s: ...<ul>", ipp)
@@ -207,7 +214,7 @@ func epAddrLess(a, b epAddr) bool {
 		return v < 0
 	}
 	if a.ap.Port() == b.ap.Port() {
-		return a.vni.get() < b.vni.get()
+		return a.vni.Get() < b.vni.Get()
 	}
 	return a.ap.Port() < b.ap.Port()
 }

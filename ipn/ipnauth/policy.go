@@ -8,9 +8,11 @@ import (
 	"fmt"
 
 	"github.com/sagernet/tailscale/client/tailscale/apitype"
+	"github.com/sagernet/tailscale/feature/buildfeatures"
 	"github.com/sagernet/tailscale/ipn"
 	"github.com/sagernet/tailscale/tailcfg"
-	"github.com/sagernet/tailscale/util/syspolicy"
+	"github.com/sagernet/tailscale/util/syspolicy/pkey"
+	"github.com/sagernet/tailscale/util/syspolicy/policyclient"
 )
 
 type actorWithPolicyChecks struct{ Actor }
@@ -50,10 +52,13 @@ func (a actorWithPolicyChecks) CheckProfileAccess(profile ipn.LoginProfileView, 
 // TODO(nickkhyl): unexport it when we move [ipn.Actor] implementations from [ipnserver]
 // and corp to this package.
 func CheckDisconnectPolicy(actor Actor, profile ipn.LoginProfileView, reason string, auditFn AuditLogFunc) error {
-	if alwaysOn, _ := syspolicy.GetBoolean(syspolicy.AlwaysOn, false); !alwaysOn {
+	if !buildfeatures.HasSystemPolicy {
 		return nil
 	}
-	if allowWithReason, _ := syspolicy.GetBoolean(syspolicy.AlwaysOnOverrideWithReason, false); !allowWithReason {
+	if alwaysOn, _ := policyclient.Get().GetBoolean(pkey.AlwaysOn, false); !alwaysOn {
+		return nil
+	}
+	if allowWithReason, _ := policyclient.Get().GetBoolean(pkey.AlwaysOnOverrideWithReason, false); !allowWithReason {
 		return errors.New("disconnect not allowed: always-on mode is enabled")
 	}
 	if reason == "" {

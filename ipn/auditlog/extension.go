@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/sagernet/tailscale/control/controlclient"
@@ -15,6 +14,7 @@ import (
 	"github.com/sagernet/tailscale/ipn"
 	"github.com/sagernet/tailscale/ipn/ipnauth"
 	"github.com/sagernet/tailscale/ipn/ipnext"
+	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/tailcfg"
 	"github.com/sagernet/tailscale/types/lazy"
 	"github.com/sagernet/tailscale/types/logger"
@@ -40,7 +40,7 @@ type extension struct {
 	store lazy.SyncValue[LogStore]
 
 	// mu protects all following fields.
-	mu sync.Mutex
+	mu syncs.Mutex
 	// logger is the current audit logger, or nil if it is not set up,
 	// such as before the first control client is created, or after
 	// a profile change and before the new control client is created.

@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !ios && !android
+//go:build !ios && !android && !ts_omit_webclient
 
 package ipnlocal
 
@@ -19,14 +19,15 @@ import (
 
 	"github.com/sagernet/tailscale/client/local"
 	"github.com/sagernet/tailscale/client/web"
-	"github.com/sagernet/tailscale/logtail/backoff"
 	"github.com/sagernet/tailscale/net/netutil"
 	"github.com/sagernet/tailscale/tailcfg"
+	"github.com/sagernet/tailscale/tsconst"
 	"github.com/sagernet/tailscale/types/logger"
+	"github.com/sagernet/tailscale/util/backoff"
 	"github.com/sagernet/tailscale/util/mak"
 )
 
-const webClientPort = web.ListenPort
+const webClientPort = tsconst.WebListenPort
 
 // webClient holds state for the web interface for managing this
 // tailscale instance. The web interface is not used by default,

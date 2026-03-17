@@ -18,7 +18,6 @@ import (
 
 	"github.com/dblohm7/wingoes"
 	"github.com/sagernet/tailscale/types/logger"
-	"github.com/sagernet/tailscale/util/multierr"
 	"golang.org/x/sys/windows"
 )
 
@@ -538,7 +537,7 @@ func (rps RestartableProcesses) Terminate(logf logger.Logf, exitCode uint32, tim
 	}
 
 	if len(errs) != 0 {
-		return multierr.New(errs...)
+		return errors.Join(errs...)
 	}
 	return nil
 }

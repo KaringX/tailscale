@@ -13,13 +13,14 @@ import (
 	"github.com/sagernet/tailscale/net/tsaddr"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/util/mak"
+	"github.com/sagernet/tailscale/util/syspolicy/policyclient"
 	"go4.org/mem"
 )
 
 // NewOSConfigurator creates a new OS configurator.
 //
 // The health tracker and the knobs may be nil and are ignored on this platform.
-func NewOSConfigurator(logf logger.Logf, _ *health.Tracker, _ *controlknobs.Knobs, ifName string) (OSConfigurator, error) {
+func NewOSConfigurator(logf logger.Logf, _ *health.Tracker, _ policyclient.Client, _ *controlknobs.Knobs, ifName string) (OSConfigurator, error) {
 	return &darwinConfigurator{logf: logf, ifName: ifName}, nil
 }
 

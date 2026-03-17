@@ -201,6 +201,13 @@ func NewSemaphore(n int) Semaphore {
 	return Semaphore{c: make(chan struct{}, n)}
 }
 
+// Len reports the number of in-flight acquisitions.
+// It is incremented whenever the semaphore is acquired.
+// It is decremented whenever the semaphore is released.
+func (s Semaphore) Len() int {
+	return len(s.c)
+}
+
 // Acquire blocks until a resource is acquired.
 func (s Semaphore) Acquire() {
 	s.c <- struct{}{}
@@ -401,20 +408,4 @@ func (m *Map[K, V]) Swap(key K, value V) (oldValue V) {
 	oldValue = m.m[key]
 	mak.Set(&m.m, key, value)
 	return oldValue
-}
-
-// WaitGroup is identical to [sync.WaitGroup],
-// but provides a Go method to start a goroutine.
-type WaitGroup struct{ sync.WaitGroup }
-
-// Go calls the given function in a new goroutine.
-// It automatically increments the counter before execution and
-// automatically decrements the counter after execution.
-// It must not be called concurrently with Wait.
-func (wg *WaitGroup) Go(f func()) {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		f()
-	}()
 }

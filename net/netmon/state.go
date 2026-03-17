@@ -15,10 +15,11 @@ import (
 	"strings"
 
 	"github.com/sagernet/tailscale/envknob"
+	"github.com/sagernet/tailscale/feature"
+	"github.com/sagernet/tailscale/feature/buildfeatures"
 	"github.com/sagernet/tailscale/hostinfo"
 	"github.com/sagernet/tailscale/net/netaddr"
 	"github.com/sagernet/tailscale/net/tsaddr"
-	"github.com/sagernet/tailscale/net/tshttpproxy"
 	"github.com/sagernet/tailscale/util/mak"
 )
 
@@ -182,6 +183,10 @@ func (ifaces InterfaceList) ForeachInterfaceAddress(fn func(Interface, netip.Pre
 				if pfx, ok := netaddr.FromStdIPNet(v); ok {
 					fn(iface, pfx)
 				}
+			case *net.IPAddr:
+				if ip, ok := netip.AddrFromSlice(v.IP); ok {
+					fn(iface, netip.PrefixFrom(ip, ip.BitLen()))
+				}
 			}
 		}
 	}
@@ -213,6 +218,10 @@ func (ifaces InterfaceList) ForeachInterface(fn func(Interface, []netip.Prefix))
 			case *net.IPNet:
 				if pfx, ok := netaddr.FromStdIPNet(v); ok {
 					pfxs = append(pfxs, pfx)
+				}
+			case *net.IPAddr:
+				if ip, ok := netip.AddrFromSlice(v.IP); ok {
+					pfxs = append(pfxs, netip.PrefixFrom(ip, ip.BitLen()))
 				}
 			}
 		}
@@ -501,13 +510,15 @@ func getState(optTSInterfaceName string) (*State, error) {
 		}
 	}
 
-	if s.AnyInterfaceUp() {
+	if buildfeatures.HasUseProxy && s.AnyInterfaceUp() {
 		req, err := http.NewRequest("GET", LoginEndpointForProxyDetermination, nil)
 		if err != nil {
 			return nil, err
 		}
-		if u, err := tshttpproxy.ProxyFromEnvironment(req); err == nil && u != nil {
-			s.HTTPProxy = u.String()
+		if proxyFromEnv, ok := feature.HookProxyFromEnvironment.GetOk(); ok {
+			if u, err := proxyFromEnv(req); err == nil && u != nil {
+				s.HTTPProxy = u.String()
+			}
 		}
 		if getPAC != nil {
 			s.PAC = getPAC()
@@ -569,6 +580,9 @@ var disableLikelyHomeRouterIPSelf = envknob.RegisterBool("TS_DEBUG_DISABLE_LIKEL
 // the LAN using that gateway.
 // This is used as the destination for UPnP, NAT-PMP, PCP, etc queries.
 func LikelyHomeRouterIP() (gateway, myIP netip.Addr, ok bool) {
+	if !buildfeatures.HasPortMapper {
+		return
+	}
 	// If we don't have a way to get the home router IP, then we can't do
 	// anything; just return.
 	if likelyHomeRouterIP == nil {

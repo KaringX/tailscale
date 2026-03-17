@@ -17,12 +17,16 @@ import (
 	"time"
 
 	"github.com/sagernet/tailscale/feature"
+	"github.com/sagernet/tailscale/feature/buildfeatures"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/wireguard-go/tun"
 )
 
-// CrateTAP is the hook set by feature/tap.
+// CreateTAP is the hook maybe set by feature/tap.
 var CreateTAP feature.Hook[func(logf logger.Logf, tapName, bridgeName string) (tun.Device, error)]
+
+// HookSetLinkAttrs is the hook maybe set by feature/linkspeed.
+var HookSetLinkAttrs feature.Hook[func(tun.Device) error]
 
 // modprobeTunHook is a Linux-specific hook to run "/sbin/modprobe tun".
 var modprobeTunHook feature.Hook[func() error]
@@ -78,8 +82,12 @@ func New(logf logger.Logf, tunName string) (tun.Device, string, error) {
 		dev.Close()
 		return nil, "", err
 	}
-	if err := setLinkAttrs(dev); err != nil {
-		logf("setting link attributes: %v", err)
+	if buildfeatures.HasLinkSpeed {
+		if f, ok := HookSetLinkAttrs.GetOk(); ok {
+			if err := f(dev); err != nil {
+				logf("setting link attributes: %v", err)
+			}
+		}
 	}
 	name, err := interfaceName(dev)
 	if err != nil {

@@ -7,7 +7,8 @@ package views
 
 import (
 	"bytes"
-	"encoding/json"
+	"cmp"
+	jsonv1 "encoding/json"
 	"errors"
 	"fmt"
 	"iter"
@@ -15,19 +16,11 @@ import (
 	"reflect"
 	"slices"
 
+	jsonv2 "github.com/go-json-experiment/json"
+	"github.com/go-json-experiment/json/jsontext"
 	"github.com/sagernet/tailscale/types/ptr"
 	"go4.org/mem"
 )
-
-func unmarshalSliceFromJSON[T any](b []byte, x *[]T) error {
-	if *x != nil {
-		return errors.New("already initialized")
-	}
-	if len(b) == 0 {
-		return nil
-	}
-	return json.Unmarshal(b, x)
-}
 
 // ByteSlice is a read-only accessor for types that are backed by a []byte.
 type ByteSlice[T ~[]byte] struct {
@@ -93,15 +86,32 @@ func (v ByteSlice[T]) SliceTo(i int) ByteSlice[T] { return ByteSlice[T]{v.ж[:i]
 // Slice returns v[i:j]
 func (v ByteSlice[T]) Slice(i, j int) ByteSlice[T] { return ByteSlice[T]{v.ж[i:j]} }
 
-// MarshalJSON implements json.Marshaler.
-func (v ByteSlice[T]) MarshalJSON() ([]byte, error) { return json.Marshal(v.ж) }
+// MarshalJSON implements [jsonv1.Marshaler].
+func (v ByteSlice[T]) MarshalJSON() ([]byte, error) {
+	return jsonv1.Marshal(v.ж)
+}
 
-// UnmarshalJSON implements json.Unmarshaler.
+// MarshalJSONTo implements [jsonv2.MarshalerTo].
+func (v ByteSlice[T]) MarshalJSONTo(enc *jsontext.Encoder) error {
+	return jsonv2.MarshalEncode(enc, v.ж)
+}
+
+// UnmarshalJSON implements [jsonv1.Unmarshaler].
+// It must only be called on an uninitialized ByteSlice.
 func (v *ByteSlice[T]) UnmarshalJSON(b []byte) error {
 	if v.ж != nil {
 		return errors.New("already initialized")
 	}
-	return json.Unmarshal(b, &v.ж)
+	return jsonv1.Unmarshal(b, &v.ж)
+}
+
+// UnmarshalJSONFrom implements [jsonv2.UnmarshalerFrom].
+// It must only be called on an uninitialized ByteSlice.
+func (v *ByteSlice[T]) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	if v.ж != nil {
+		return errors.New("already initialized")
+	}
+	return jsonv2.UnmarshalDecode(dec, &v.ж)
 }
 
 // StructView represents the corresponding StructView of a Viewable. The concrete types are
@@ -159,11 +169,35 @@ func (v SliceView[T, V]) All() iter.Seq2[int, V] {
 	}
 }
 
-// MarshalJSON implements json.Marshaler.
-func (v SliceView[T, V]) MarshalJSON() ([]byte, error) { return json.Marshal(v.ж) }
+// MarshalJSON implements [jsonv1.Marshaler].
+func (v SliceView[T, V]) MarshalJSON() ([]byte, error) {
+	return jsonv1.Marshal(v.ж)
+}
 
-// UnmarshalJSON implements json.Unmarshaler.
-func (v *SliceView[T, V]) UnmarshalJSON(b []byte) error { return unmarshalSliceFromJSON(b, &v.ж) }
+// MarshalJSONTo implements [jsonv2.MarshalerTo].
+func (v SliceView[T, V]) MarshalJSONTo(enc *jsontext.Encoder) error {
+	return jsonv2.MarshalEncode(enc, v.ж)
+}
+
+// UnmarshalJSON implements [jsonv1.Unmarshaler].
+// It must only be called on an uninitialized SliceView.
+func (v *SliceView[T, V]) UnmarshalJSON(b []byte) error {
+	if v.ж != nil {
+		return errors.New("already initialized")
+	} else if len(b) == 0 {
+		return nil
+	}
+	return jsonv1.Unmarshal(b, &v.ж)
+}
+
+// UnmarshalJSONFrom implements [jsonv2.UnmarshalerFrom].
+// It must only be called on an uninitialized SliceView.
+func (v *SliceView[T, V]) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	if v.ж != nil {
+		return errors.New("already initialized")
+	}
+	return jsonv2.UnmarshalDecode(dec, &v.ж)
+}
 
 // IsNil reports whether the underlying slice is nil.
 func (v SliceView[T, V]) IsNil() bool { return v.ж == nil }
@@ -252,14 +286,34 @@ func SliceOf[T any](x []T) Slice[T] {
 	return Slice[T]{x}
 }
 
-// MarshalJSON implements json.Marshaler.
+// MarshalJSON implements [jsonv1.Marshaler].
 func (v Slice[T]) MarshalJSON() ([]byte, error) {
-	return json.Marshal(v.ж)
+	return jsonv1.Marshal(v.ж)
 }
 
-// UnmarshalJSON implements json.Unmarshaler.
+// MarshalJSONTo implements [jsonv2.MarshalerTo].
+func (v Slice[T]) MarshalJSONTo(enc *jsontext.Encoder) error {
+	return jsonv2.MarshalEncode(enc, v.ж)
+}
+
+// UnmarshalJSON implements [jsonv1.Unmarshaler].
+// It must only be called on an uninitialized Slice.
 func (v *Slice[T]) UnmarshalJSON(b []byte) error {
-	return unmarshalSliceFromJSON(b, &v.ж)
+	if v.ж != nil {
+		return errors.New("already initialized")
+	} else if len(b) == 0 {
+		return nil
+	}
+	return jsonv1.Unmarshal(b, &v.ж)
+}
+
+// UnmarshalJSONFrom implements [jsonv2.UnmarshalerFrom].
+// It must only be called on an uninitialized Slice.
+func (v *Slice[T]) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	if v.ж != nil {
+		return errors.New("already initialized")
+	}
+	return jsonv2.UnmarshalDecode(dec, &v.ж)
 }
 
 // IsNil reports whether the underlying slice is nil.
@@ -310,6 +364,20 @@ func (v Slice[T]) ContainsFunc(f func(T) bool) bool {
 	return slices.ContainsFunc(v.ж, f)
 }
 
+// MaxFunc returns the maximal value in v, using cmp to compare elements. It
+// panics if v is empty. If there is more than one maximal element according to
+// the cmp function, MaxFunc returns the first one. See also [slices.MaxFunc].
+func (v Slice[T]) MaxFunc(cmp func(a, b T) int) T {
+	return slices.MaxFunc(v.ж, cmp)
+}
+
+// MinFunc returns the minimal value in v, using cmp to compare elements. It
+// panics if v is empty. If there is more than one minimal element according to
+// the cmp function, MinFunc returns the first one. See also [slices.MinFunc].
+func (v Slice[T]) MinFunc(cmp func(a, b T) int) T {
+	return slices.MinFunc(v.ж, cmp)
+}
+
 // AppendStrings appends the string representation of each element in v to dst.
 func AppendStrings[T fmt.Stringer](dst []string, v Slice[T]) []string {
 	for _, x := range v.ж {
@@ -328,6 +396,20 @@ func SliceContains[T comparable](v Slice[T], e T) bool {
 // SliceEqual is like the standard library's slices.Equal, but for two views.
 func SliceEqual[T comparable](a, b Slice[T]) bool {
 	return slices.Equal(a.ж, b.ж)
+}
+
+// SliceMax returns the maximal value in v. It panics if v is empty. For
+// floating point T, SliceMax propagates NaNs (any NaN value in v forces the
+// output to be NaN). See also [slices.Max].
+func SliceMax[T cmp.Ordered](v Slice[T]) T {
+	return slices.Max(v.ж)
+}
+
+// SliceMin returns the minimal value in v. It panics if v is empty. For
+// floating point T, SliceMin propagates NaNs (any NaN value in v forces the
+// output to be NaN). See also [slices.Min].
+func SliceMin[T cmp.Ordered](v Slice[T]) T {
+	return slices.Min(v.ж)
 }
 
 // shortOOOLen (short Out-of-Order length) is the slice length at or
@@ -512,18 +594,32 @@ func (m MapSlice[K, V]) GetOk(k K) (Slice[V], bool) {
 	return SliceOf(v), ok
 }
 
-// MarshalJSON implements json.Marshaler.
+// MarshalJSON implements [jsonv1.Marshaler].
 func (m MapSlice[K, V]) MarshalJSON() ([]byte, error) {
-	return json.Marshal(m.ж)
+	return jsonv1.Marshal(m.ж)
 }
 
-// UnmarshalJSON implements json.Unmarshaler.
+// MarshalJSONTo implements [jsonv2.MarshalerTo].
+func (m MapSlice[K, V]) MarshalJSONTo(enc *jsontext.Encoder) error {
+	return jsonv2.MarshalEncode(enc, m.ж)
+}
+
+// UnmarshalJSON implements [jsonv1.Unmarshaler].
 // It should only be called on an uninitialized Map.
 func (m *MapSlice[K, V]) UnmarshalJSON(b []byte) error {
 	if m.ж != nil {
 		return errors.New("already initialized")
 	}
-	return json.Unmarshal(b, &m.ж)
+	return jsonv1.Unmarshal(b, &m.ж)
+}
+
+// UnmarshalJSONFrom implements [jsonv2.UnmarshalerFrom].
+// It should only be called on an uninitialized MapSlice.
+func (m *MapSlice[K, V]) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	if m.ж != nil {
+		return errors.New("already initialized")
+	}
+	return jsonv2.UnmarshalDecode(dec, &m.ж)
 }
 
 // AsMap returns a shallow-clone of the underlying map.
@@ -600,18 +696,32 @@ func (m Map[K, V]) GetOk(k K) (V, bool) {
 	return v, ok
 }
 
-// MarshalJSON implements json.Marshaler.
+// MarshalJSON implements [jsonv1.Marshaler].
 func (m Map[K, V]) MarshalJSON() ([]byte, error) {
-	return json.Marshal(m.ж)
+	return jsonv1.Marshal(m.ж)
 }
 
-// UnmarshalJSON implements json.Unmarshaler.
+// MarshalJSONTo implements [jsonv2.MarshalerTo].
+func (m Map[K, V]) MarshalJSONTo(enc *jsontext.Encoder) error {
+	return jsonv2.MarshalEncode(enc, m.ж)
+}
+
+// UnmarshalJSON implements [jsonv1.Unmarshaler].
 // It should only be called on an uninitialized Map.
 func (m *Map[K, V]) UnmarshalJSON(b []byte) error {
 	if m.ж != nil {
 		return errors.New("already initialized")
 	}
-	return json.Unmarshal(b, &m.ж)
+	return jsonv1.Unmarshal(b, &m.ж)
+}
+
+// UnmarshalJSONFrom implements [jsonv2.UnmarshalerFrom].
+// It must only be called on an uninitialized Map.
+func (m *Map[K, V]) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	if m.ж != nil {
+		return errors.New("already initialized")
+	}
+	return jsonv2.UnmarshalDecode(dec, &m.ж)
 }
 
 // AsMap returns a shallow-clone of the underlying map.
@@ -809,17 +919,32 @@ func ValuePointerOf[T any](v *T) ValuePointer[T] {
 	return ValuePointer[T]{v}
 }
 
-// MarshalJSON implements [json.Marshaler].
+// MarshalJSON implements [jsonv1.Marshaler].
 func (p ValuePointer[T]) MarshalJSON() ([]byte, error) {
-	return json.Marshal(p.ж)
+	return jsonv1.Marshal(p.ж)
 }
 
-// UnmarshalJSON implements [json.Unmarshaler].
+// MarshalJSONTo implements [jsonv2.MarshalerTo].
+func (p ValuePointer[T]) MarshalJSONTo(enc *jsontext.Encoder) error {
+	return jsonv2.MarshalEncode(enc, p.ж)
+}
+
+// UnmarshalJSON implements [jsonv1.Unmarshaler].
+// It must only be called on an uninitialized ValuePointer.
 func (p *ValuePointer[T]) UnmarshalJSON(b []byte) error {
 	if p.ж != nil {
 		return errors.New("already initialized")
 	}
-	return json.Unmarshal(b, &p.ж)
+	return jsonv1.Unmarshal(b, &p.ж)
+}
+
+// UnmarshalJSONFrom implements [jsonv2.UnmarshalerFrom].
+// It must only be called on an uninitialized ValuePointer.
+func (p *ValuePointer[T]) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	if p.ж != nil {
+		return errors.New("already initialized")
+	}
+	return jsonv2.UnmarshalDecode(dec, &p.ж)
 }
 
 // ContainsPointers reports whether T contains any pointers,

@@ -8,6 +8,7 @@ import (
 	"cmp"
 	"context"
 	crand "crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -36,9 +37,9 @@ import (
 	"github.com/sagernet/tailscale/tailcfg"
 	"github.com/sagernet/tailscale/types/key"
 	"github.com/sagernet/tailscale/types/logger"
+	wgconn "github.com/sagernet/wireguard-go/conn"
+	"github.com/sagernet/wireguard-go/device"
 	"github.com/sagernet/wireguard-go/tun"
-	wgconn "github.com/tailscale/wireguard-go/conn"
-	"github.com/tailscale/wireguard-go/device"
 	"go4.org/netipx"
 )
 
@@ -68,7 +69,7 @@ type derpProber struct {
 	ProbeMap ProbeClass
 
 	// Probe classes for probing individual derpers.
-	tlsProbeFn  func(string) ProbeClass
+	tlsProbeFn  func(string, *tls.Config) ProbeClass
 	udpProbeFn  func(string, int) ProbeClass
 	meshProbeFn func(string, string) ProbeClass
 	bwProbeFn   func(string, string, int64) ProbeClass
@@ -206,7 +207,7 @@ func (d *derpProber) probeMapFn(ctx context.Context) error {
 				if d.probes[n] == nil {
 					log.Printf("adding DERP TLS probe for %s (%s) every %v", server.Name, region.RegionName, d.tlsInterval)
 					derpPort := cmp.Or(server.DERPPort, 443)
-					d.probes[n] = d.p.Run(n, d.tlsInterval, labels, d.tlsProbeFn(fmt.Sprintf("%s:%d", server.HostName, derpPort)))
+					d.probes[n] = d.p.Run(n, d.tlsInterval, labels, d.tlsProbeFn(fmt.Sprintf("%s:%d", server.HostName, derpPort), nil))
 				}
 			}
 
@@ -322,14 +323,14 @@ func (d *derpProber) probeBandwidth(from, to string, size int64) ProbeClass {
 			"derp_path":  derpPath,
 			"tcp_in_tcp": strconv.FormatBool(d.bwTUNIPv4Prefix != nil),
 		},
-		Metrics: func(l prometheus.Labels) []prometheus.Metric {
+		Metrics: func(lb prometheus.Labels) []prometheus.Metric {
 			metrics := []prometheus.Metric{
-				prometheus.MustNewConstMetric(prometheus.NewDesc("derp_bw_probe_size_bytes", "Payload size of the bandwidth prober", nil, l), prometheus.GaugeValue, float64(size)),
-				prometheus.MustNewConstMetric(prometheus.NewDesc("derp_bw_transfer_time_seconds_total", "Time it took to transfer data", nil, l), prometheus.CounterValue, transferTimeSeconds.Value()),
+				prometheus.MustNewConstMetric(prometheus.NewDesc("derp_bw_probe_size_bytes", "Payload size of the bandwidth prober", nil, lb), prometheus.GaugeValue, float64(size)),
+				prometheus.MustNewConstMetric(prometheus.NewDesc("derp_bw_transfer_time_seconds_total", "Time it took to transfer data", nil, lb), prometheus.CounterValue, transferTimeSeconds.Value()),
 			}
 			if d.bwTUNIPv4Prefix != nil {
 				// For TCP-in-TCP probes, also record cumulative bytes transferred.
-				metrics = append(metrics, prometheus.MustNewConstMetric(prometheus.NewDesc("derp_bw_bytes_total", "Amount of data transferred", nil, l), prometheus.CounterValue, totalBytesTransferred.Value()))
+				metrics = append(metrics, prometheus.MustNewConstMetric(prometheus.NewDesc("derp_bw_bytes_total", "Amount of data transferred", nil, lb), prometheus.CounterValue, totalBytesTransferred.Value()))
 			}
 			return metrics
 		},
@@ -360,11 +361,11 @@ func (d *derpProber) probeQueuingDelay(from, to string, packetsPerSecond int, pa
 		},
 		Class:  "derp_qd",
 		Labels: Labels{"derp_path": derpPath},
-		Metrics: func(l prometheus.Labels) []prometheus.Metric {
+		Metrics: func(lb prometheus.Labels) []prometheus.Metric {
 			qdh.mx.Lock()
 			result := []prometheus.Metric{
-				prometheus.MustNewConstMetric(prometheus.NewDesc("derp_qd_probe_dropped_packets", "Total packets dropped", nil, l), prometheus.CounterValue, float64(packetsDropped.Value())),
-				prometheus.MustNewConstHistogram(prometheus.NewDesc("derp_qd_probe_delays_seconds", "Distribution of queuing delays", nil, l), qdh.count, qdh.sum, maps.Clone(qdh.bucketedCounts)),
+				prometheus.MustNewConstMetric(prometheus.NewDesc("derp_qd_probe_dropped_packets", "Total packets dropped", nil, lb), prometheus.CounterValue, float64(packetsDropped.Value())),
+				prometheus.MustNewConstHistogram(prometheus.NewDesc("derp_qd_probe_delays_seconds", "Distribution of queuing delays", nil, lb), qdh.count, qdh.sum, maps.Clone(qdh.bucketedCounts)),
 			}
 			qdh.mx.Unlock()
 			return result
@@ -1045,11 +1046,11 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds, totalBytesT
 	}()
 
 	// Start a listener to receive the data
-	l, err := net.Listen("tcp", net.JoinHostPort(ifAddr.String(), "0"))
+	ln, err := net.Listen("tcp", net.JoinHostPort(ifAddr.String(), "0"))
 	if err != nil {
 		return fmt.Errorf("failed to listen: %s", err)
 	}
-	defer l.Close()
+	defer ln.Close()
 
 	// 128KB by default
 	const writeChunkSize = 128 << 10
@@ -1061,9 +1062,9 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds, totalBytesT
 	}
 
 	// Dial ourselves
-	_, port, err := net.SplitHostPort(l.Addr().String())
+	_, port, err := net.SplitHostPort(ln.Addr().String())
 	if err != nil {
-		return fmt.Errorf("failed to split address %q: %w", l.Addr().String(), err)
+		return fmt.Errorf("failed to split address %q: %w", ln.Addr().String(), err)
 	}
 
 	connAddr := net.JoinHostPort(destinationAddr.String(), port)
@@ -1084,7 +1085,7 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds, totalBytesT
 	go func() {
 		defer wg.Done()
 
-		readConn, err := l.Accept()
+		readConn, err := ln.Accept()
 		if err != nil {
 			readFinishedC <- err
 			return
@@ -1145,11 +1146,11 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds, totalBytesT
 
 func newConn(ctx context.Context, dm *tailcfg.DERPMap, n *tailcfg.DERPNode, isProber bool, meshKey key.DERPMesh) (*derphttp.Client, error) {
 	// To avoid spamming the log with regular connection messages.
-	l := logger.Filtered(log.Printf, func(s string) bool {
+	logf := logger.Filtered(log.Printf, func(s string) bool {
 		return !strings.Contains(s, "derphttp.Client.Connect: connecting to")
 	})
 	priv := key.NewNode()
-	dc := derphttp.NewRegionClient(priv, l, netmon.NewStatic(), func() *tailcfg.DERPRegion {
+	dc := derphttp.NewRegionClient(priv, logf, netmon.NewStatic(), func() *tailcfg.DERPRegion {
 		rid := n.RegionID
 		return &tailcfg.DERPRegion{
 			RegionID:   rid,

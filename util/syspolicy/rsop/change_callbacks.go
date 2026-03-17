@@ -9,8 +9,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/util/set"
 	"github.com/sagernet/tailscale/util/syspolicy/internal/loggerx"
+	"github.com/sagernet/tailscale/util/syspolicy/pkey"
+	"github.com/sagernet/tailscale/util/syspolicy/policyclient"
+	"github.com/sagernet/tailscale/util/syspolicy/ptype"
 	"github.com/sagernet/tailscale/util/syspolicy/setting"
 )
 
@@ -20,7 +24,7 @@ type Change[T any] struct {
 }
 
 // PolicyChangeCallback is a function called whenever a policy changes.
-type PolicyChangeCallback func(*PolicyChange)
+type PolicyChangeCallback func(policyclient.PolicyChange)
 
 // PolicyChange describes a policy change.
 type PolicyChange struct {
@@ -37,8 +41,8 @@ func (c PolicyChange) Old() *setting.Snapshot {
 	return c.snapshots.Old
 }
 
-// HasChanged reports whether a policy setting with the specified [setting.Key], has changed.
-func (c PolicyChange) HasChanged(key setting.Key) bool {
+// HasChanged reports whether a policy setting with the specified [pkey.Key], has changed.
+func (c PolicyChange) HasChanged(key pkey.Key) bool {
 	new, newErr := c.snapshots.New.GetErr(key)
 	old, oldErr := c.snapshots.Old.GetErr(key)
 	if newErr != nil && oldErr != nil {
@@ -48,7 +52,7 @@ func (c PolicyChange) HasChanged(key setting.Key) bool {
 		return true
 	}
 	switch newVal := new.(type) {
-	case bool, uint64, string, setting.Visibility, setting.PreferenceOption, time.Duration:
+	case bool, uint64, string, ptype.Visibility, ptype.PreferenceOption, time.Duration:
 		return newVal != old
 	case []string:
 		oldVal, ok := old.([]string)
@@ -60,14 +64,14 @@ func (c PolicyChange) HasChanged(key setting.Key) bool {
 }
 
 // HasChangedAnyOf reports whether any of the specified policy settings has changed.
-func (c PolicyChange) HasChangedAnyOf(keys ...setting.Key) bool {
+func (c PolicyChange) HasChangedAnyOf(keys ...pkey.Key) bool {
 	return slices.ContainsFunc(keys, c.HasChanged)
 }
 
 // policyChangeCallbacks are the callbacks to invoke when the effective policy changes.
 // It is safe for concurrent use.
 type policyChangeCallbacks struct {
-	mu  sync.Mutex
+	mu  syncs.Mutex
 	cbs set.HandleSet[PolicyChangeCallback]
 }
 

@@ -17,7 +17,6 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,12 +25,13 @@ import (
 	"github.com/sagernet/tailscale/net/packet"
 	"github.com/sagernet/tailscale/net/stun"
 	"github.com/sagernet/tailscale/net/tstun"
+	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/tailcfg"
 	"github.com/sagernet/tailscale/tstime/mono"
 	"github.com/sagernet/tailscale/types/key"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/util/mak"
-	"github.com/sagernet/tailscale/util/ringbuffer"
+	"github.com/sagernet/tailscale/util/ringlog"
 	"github.com/sagernet/tailscale/util/slicesx"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -62,7 +62,7 @@ type endpoint struct {
 	lastRecvWG            mono.Time // last time there were incoming packets from this peer destined for wireguard-go (e.g. not disco)
 	lastRecvUDPAny        mono.Time // last time there were incoming UDP packets from this peer of any kind
 	numStopAndResetAtomic int64
-	debugUpdates          *ringbuffer.RingBuffer[EndpointChange]
+	debugUpdates          *ringlog.RingLog[EndpointChange]
 
 	// These fields are initialized once and never modified.
 	c            *Conn
@@ -75,7 +75,7 @@ type endpoint struct {
 	disco atomic.Pointer[endpointDisco] // if the peer supports disco, the key and short string
 
 	// mu protects all following fields.
-	mu sync.Mutex // Lock ordering: Conn.mu, then endpoint.mu
+	mu syncs.Mutex // Lock ordering: Conn.mu, then endpoint.mu
 
 	heartBeatTimer            *time.Timer    // nil when idle
 	lastSendExt               mono.Time      // last time there were outgoing packets sent to this peer from an external trigger (e.g. wireguard-go or disco pingCLI)
@@ -110,7 +110,7 @@ func (de *endpoint) udpRelayEndpointReady(maybeBest addrQuality) {
 	defer de.mu.Unlock()
 	now := mono.Now()
 	curBestAddrTrusted := now.Before(de.trustBestAddrUntil)
-	sameRelayServer := de.bestAddr.vni.isSet() && maybeBest.relayServerDisco.Compare(de.bestAddr.relayServerDisco) == 0
+	sameRelayServer := de.bestAddr.vni.IsSet() && maybeBest.relayServerDisco.Compare(de.bestAddr.relayServerDisco) == 0
 
 	if !curBestAddrTrusted ||
 		sameRelayServer ||
@@ -697,7 +697,7 @@ func (de *endpoint) maybeProbeUDPLifetimeLocked() (afterInactivityFor time.Durat
 	// shuffling probing probability where the local node ends up with a large
 	// key value lexicographically relative to the other nodes it tends to
 	// communicate with. If de's disco key changes, the cycle will reset.
-	if de.c.discoPublic.Compare(epDisco.key) >= 0 {
+	if de.c.discoAtomic.Public().Compare(epDisco.key) >= 0 {
 		// lower disco pub key node probes higher
 		return afterInactivityFor, false
 	}
@@ -879,14 +879,6 @@ func (de *endpoint) setHeartbeatDisabled(v bool) {
 
 // discoverUDPRelayPathsLocked starts UDP relay path discovery.
 func (de *endpoint) discoverUDPRelayPathsLocked(now mono.Time) {
-	if !de.c.hasPeerRelayServers.Load() {
-		// Changes in this value between its access and the logic following
-		// are fine, we will eventually do the "right" thing during future path
-		// discovery. The worst case is we suppress path discovery for the
-		// current cycle, or we unnecessarily call into [relayManager] and do
-		// some wasted work.
-		return
-	}
 	de.lastUDPRelayPathDiscovery = now
 	lastBest := de.bestAddr
 	lastBestIsTrusted := mono.Now().Before(de.trustBestAddrUntil)
@@ -897,6 +889,14 @@ func (de *endpoint) discoverUDPRelayPathsLocked(now mono.Time) {
 // path discovery.
 func (de *endpoint) wantUDPRelayPathDiscoveryLocked(now mono.Time) bool {
 	if runtime.GOOS == "js" {
+		return false
+	}
+	if !de.c.hasPeerRelayServers.Load() {
+		// Changes in this value between its access and a call to
+		// [endpoint.discoverUDPRelayPathsLocked] are fine, we will eventually
+		// do the "right" thing during future path discovery. The worst case is
+		// we suppress path discovery for the current cycle, or we unnecessarily
+		// call into [relayManager] and do some wasted work.
 		return false
 	}
 	if !de.relayCapable {
@@ -994,15 +994,36 @@ func (de *endpoint) discoPing(res *ipnstate.PingResult, size int, cb func(*ipnst
 	if derpAddr.IsValid() {
 		de.startDiscoPingLocked(epAddr{ap: derpAddr}, now, pingCLI, size, resCB)
 	}
-	if udpAddr.ap.IsValid() && now.Before(de.trustBestAddrUntil) {
-		// Already have an active session, so just ping the address we're using.
-		// Otherwise "tailscale ping" results to a node on the local network
-		// can look like they're bouncing between, say 10.0.0.0/9 and the peer's
-		// IPv6 address, both 1ms away, and it's random who replies first.
+
+	switch {
+	case udpAddr.ap.IsValid() && now.Before(de.trustBestAddrUntil):
+		// We have a "trusted" direct OR peer relay address, ping it.
 		de.startDiscoPingLocked(udpAddr, now, pingCLI, size, resCB)
-	} else {
+		if !udpAddr.vni.IsSet() {
+			// If the path is direct we do not want to fallthrough to pinging
+			// all candidate direct paths, otherwise "tailscale ping" results to
+			// a node on the local network can look like they're bouncing
+			// between, say 10.0.0.0/8 and the peer's IPv6 address, both 1ms
+			// away, and it's random who replies first. cb() is called with the
+			// first reply, vs background path discovery that is subject to
+			// betterAddr() comparison and hysteresis
+			break
+		}
+		// If the trusted path is via a peer relay we want to fallthrough in
+		// order to also try all candidate direct paths.
+		fallthrough
+	default:
+		// Ping all candidate direct paths and start peer relay path discovery,
+		// if appropriate. This work overlaps with what [de.heartbeat] will
+		// periodically fire when it calls [de.sendDiscoPingsLocked] and
+		// [de.discoveryUDPRelayPathsLocked], but a user-initiated [pingCLI] is
+		// a "do it now" operation that should not be subject to
+		// [heartbeatInterval] tick or [discoPingInterval] rate-limiting.
 		for ep := range de.endpointState {
 			de.startDiscoPingLocked(epAddr{ap: ep}, now, pingCLI, size, resCB)
+		}
+		if de.wantUDPRelayPathDiscoveryLocked(now) {
+			de.discoverUDPRelayPathsLocked(now)
 		}
 	}
 }
@@ -1029,14 +1050,10 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 		}
 	} else if !udpAddr.isDirect() || now.After(de.trustBestAddrUntil) {
 		de.sendDiscoPingsLocked(now, true)
+		if de.wantUDPRelayPathDiscoveryLocked(now) {
+			de.discoverUDPRelayPathsLocked(now)
+		}
 	}
-	// TODO(jwhited): consider triggering UDP relay path discovery here under
-	//  certain conditions. We currently only trigger it in heartbeat(), which
-	//  is both good and bad. It's good because the first heartbeat() tick is 3s
-	//  after the first packet, which gives us time to discover a UDP direct
-	//  path and potentially avoid what would be wasted UDP relay path discovery
-	//  work. It's bad because we might not discover a UDP direct path, and we
-	//  incur a 3s delay before we try to discover a UDP relay path.
 	de.noteTxActivityExtTriggerLocked(now)
 	de.lastSendAny = now
 	de.mu.Unlock()
@@ -1070,7 +1087,7 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 
 		switch {
 		case udpAddr.ap.Addr().Is4():
-			if udpAddr.vni.isSet() {
+			if udpAddr.vni.IsSet() {
 				de.c.metrics.outboundPacketsPeerRelayIPv4Total.Add(int64(len(buffs)))
 				de.c.metrics.outboundBytesPeerRelayIPv4Total.Add(int64(txBytes))
 			} else {
@@ -1078,7 +1095,7 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 				de.c.metrics.outboundBytesIPv4Total.Add(int64(txBytes))
 			}
 		case udpAddr.ap.Addr().Is6():
-			if udpAddr.vni.isSet() {
+			if udpAddr.vni.IsSet() {
 				de.c.metrics.outboundPacketsPeerRelayIPv6Total.Add(int64(len(buffs)))
 				de.c.metrics.outboundBytesPeerRelayIPv6Total.Add(int64(txBytes))
 			} else {
@@ -1088,8 +1105,8 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 		}
 
 		// TODO(raggi): needs updating for accuracy, as in error conditions we may have partial sends.
-		if stats := de.c.stats.Load(); err == nil && stats != nil {
-			stats.UpdateTxPhysical(de.nodeAddr, udpAddr.ap, len(buffs), txBytes)
+		if update := de.c.connCounter.Load(); err == nil && update != nil {
+			update(0, netip.AddrPortFrom(de.nodeAddr, 0), udpAddr.ap, len(buffs), txBytes, false)
 		}
 	}
 	if derpAddr.IsValid() {
@@ -1106,8 +1123,8 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 			}
 		}
 
-		if stats := de.c.stats.Load(); stats != nil {
-			stats.UpdateTxPhysical(de.nodeAddr, derpAddr, len(buffs), txBytes)
+		if update := de.c.connCounter.Load(); update != nil {
+			update(0, netip.AddrPortFrom(de.nodeAddr, 0), derpAddr, len(buffs), txBytes, false)
 		}
 		if allOk {
 			return nil
@@ -1160,7 +1177,7 @@ func (de *endpoint) discoPingTimeout(txid stun.TxID) {
 		return
 	}
 	bestUntrusted := mono.Now().After(de.trustBestAddrUntil)
-	if sp.to == de.bestAddr.epAddr && sp.to.vni.isSet() && bestUntrusted {
+	if sp.to == de.bestAddr.epAddr && sp.to.vni.IsSet() && bestUntrusted {
 		// TODO(jwhited): consider applying this to direct UDP paths as well
 		de.clearBestAddrLocked()
 	}
@@ -1269,12 +1286,15 @@ func (de *endpoint) startDiscoPingLocked(ep epAddr, now mono.Time, purpose disco
 	if runtime.GOOS == "js" {
 		return
 	}
+	if debugNeverDirectUDP() && !ep.vni.IsSet() && ep.ap.Addr() != tailcfg.DerpMagicIPAddr {
+		return
+	}
 	epDisco := de.disco.Load()
 	if epDisco == nil {
 		return
 	}
 	if purpose != pingCLI &&
-		!ep.vni.isSet() { // de.endpointState is only relevant for direct/non-vni epAddr's
+		!ep.vni.IsSet() { // de.endpointState is only relevant for direct/non-vni epAddr's
 		st, ok := de.endpointState[ep.ap]
 		if !ok {
 			// Shouldn't happen. But don't ping an endpoint that's
@@ -1610,7 +1630,7 @@ func (de *endpoint) noteBadEndpoint(udpAddr epAddr) {
 
 	de.clearBestAddrLocked()
 
-	if !udpAddr.vni.isSet() {
+	if !udpAddr.vni.IsSet() {
 		if st, ok := de.endpointState[udpAddr.ap]; ok {
 			st.clear()
 		}
@@ -1644,7 +1664,7 @@ func pingSizeToPktLen(size int, udpAddr epAddr) tstun.WireMTU {
 		headerLen = ipv6.HeaderLen
 	}
 	headerLen += 8 // UDP header length
-	if udpAddr.vni.isSet() {
+	if udpAddr.vni.IsSet() {
 		headerLen += packet.GeneveFixedHeaderLength
 	}
 	return tstun.WireMTU(size + headerLen)
@@ -1699,7 +1719,7 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 	now := mono.Now()
 	latency := now.Sub(sp.at)
 
-	if !isDerp && !src.vni.isSet() {
+	if !isDerp && !src.vni.IsSet() {
 		// Note: we check vni.isSet() as relay [epAddr]'s are not stored in
 		// endpointState, they are either de.bestAddr or not.
 		st, ok := de.endpointState[sp.to.ap]
@@ -1719,7 +1739,7 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 	}
 
 	if sp.purpose != pingHeartbeat && sp.purpose != pingHeartbeatForUDPLifetime {
-		de.c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v)  got pong tx=%x latency=%v pktlen=%v pong.src=%v%v", de.c.discoShort, de.discoShort(), de.publicKey.ShortString(), src, m.TxID[:6], latency.Round(time.Millisecond), pktLen, m.Src, logger.ArgWriter(func(bw *bufio.Writer) {
+		de.c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v)  got pong tx=%x latency=%v pktlen=%v pong.src=%v%v", de.c.discoAtomic.Short(), de.discoShort(), de.publicKey.ShortString(), src, m.TxID[:6], latency.Round(time.Millisecond), pktLen, m.Src, logger.ArgWriter(func(bw *bufio.Writer) {
 			if sp.to != src {
 				fmt.Fprintf(bw, " ping.to=%v", sp.to)
 			}
@@ -1748,11 +1768,6 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 		//  we don't clear direct UDP paths on disco ping timeout (see
 		//  discoPingTimeout).
 		if betterAddr(thisPong, de.bestAddr) {
-			if src.vni.isSet() {
-				// This would be unexpected. Switching to a Geneve-encapsulated
-				// path should only happen in de.relayEndpointReady().
-				de.c.logf("[unexpected] switching to Geneve-encapsulated path %v from %v", thisPong, de.bestAddr)
-			}
 			de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v tx=%x", de.publicKey.ShortString(), de.discoShort(), sp.to, thisPong.wireMTU, m.TxID[:6])
 			de.debugUpdates.Add(EndpointChange{
 				When: time.Now(),
@@ -1778,23 +1793,23 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 }
 
 // epAddr is a [netip.AddrPort] with an optional Geneve header (RFC8926)
-// [virtualNetworkID].
+// [packet.VirtualNetworkID].
 type epAddr struct {
-	ap  netip.AddrPort   // if ap == tailcfg.DerpMagicIPAddr then vni is never set
-	vni virtualNetworkID // vni.isSet() indicates if this [epAddr] involves a Geneve header
+	ap  netip.AddrPort          // if ap == tailcfg.DerpMagicIPAddr then vni is never set
+	vni packet.VirtualNetworkID // vni.IsSet() indicates if this [epAddr] involves a Geneve header
 }
 
 // isDirect returns true if e.ap is valid and not tailcfg.DerpMagicIPAddr,
 // and a VNI is not set.
 func (e epAddr) isDirect() bool {
-	return e.ap.IsValid() && e.ap.Addr() != tailcfg.DerpMagicIPAddr && !e.vni.isSet()
+	return e.ap.IsValid() && e.ap.Addr() != tailcfg.DerpMagicIPAddr && !e.vni.IsSet()
 }
 
 func (e epAddr) String() string {
-	if !e.vni.isSet() {
+	if !e.vni.IsSet() {
 		return e.ap.String()
 	}
-	return fmt.Sprintf("%v:vni:%d", e.ap.String(), e.vni.get())
+	return fmt.Sprintf("%v:vni:%d", e.ap.String(), e.vni.Get())
 }
 
 // addrQuality is an [epAddr], an optional [key.DiscoPublic] if a relay server
@@ -1833,10 +1848,10 @@ func betterAddr(a, b addrQuality) bool {
 
 	// Geneve-encapsulated paths (UDP relay servers) are lower preference in
 	// relation to non.
-	if !a.vni.isSet() && b.vni.isSet() {
+	if !a.vni.IsSet() && b.vni.IsSet() {
 		return true
 	}
-	if a.vni.isSet() && !b.vni.isSet() {
+	if a.vni.IsSet() && !b.vni.IsSet() {
 		return false
 	}
 
@@ -1964,7 +1979,25 @@ func (de *endpoint) handleCallMeMaybe(m *disco.CallMeMaybe) {
 	for _, st := range de.endpointState {
 		st.lastPing = 0
 	}
-	de.sendDiscoPingsLocked(mono.Now(), false)
+	monoNow := mono.Now()
+	de.sendDiscoPingsLocked(monoNow, false)
+
+	// This hook is required to trigger peer relay path discovery around
+	// disco "tailscale ping" initiated by de. We may be configured with peer
+	// relay servers that differ from de.
+	//
+	// The only other peer relay path discovery hook is in [endpoint.heartbeat],
+	// which is kicked off around outbound WireGuard packet flow, or if you are
+	// the "tailscale ping" initiator. Disco "tailscale ping" does not propagate
+	// into wireguard-go.
+	//
+	// We choose not to hook this around disco ping reception since peer relay
+	// path discovery can also trigger disco ping transmission, which *could*
+	// lead to an infinite loop of peer relay path discovery between two peers,
+	// absent intended triggers.
+	if de.wantUDPRelayPathDiscoveryLocked(monoNow) {
+		de.discoverUDPRelayPathsLocked(monoNow)
+	}
 }
 
 func (de *endpoint) populatePeerStatus(ps *ipnstate.PeerStatus) {
@@ -1982,7 +2015,7 @@ func (de *endpoint) populatePeerStatus(ps *ipnstate.PeerStatus) {
 	ps.Active = now.Sub(de.lastSendExt) < sessionActiveTimeout
 
 	if udpAddr, derpAddr, _ := de.addrForSendLocked(now); udpAddr.ap.IsValid() && !derpAddr.IsValid() {
-		if udpAddr.vni.isSet() {
+		if udpAddr.vni.IsSet() {
 			ps.PeerRelay = udpAddr.String()
 		} else {
 			ps.CurAddr = udpAddr.String()

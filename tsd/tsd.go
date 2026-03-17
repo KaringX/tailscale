@@ -33,6 +33,7 @@ import (
 	"github.com/sagernet/tailscale/proxymap"
 	"github.com/sagernet/tailscale/types/netmap"
 	"github.com/sagernet/tailscale/util/eventbus"
+	"github.com/sagernet/tailscale/util/syspolicy/policyclient"
 	"github.com/sagernet/tailscale/util/usermetric"
 	"github.com/sagernet/tailscale/wgengine"
 	"github.com/sagernet/tailscale/wgengine/magicsock"
@@ -58,6 +59,8 @@ type System struct {
 	Netstack       SubSystem[NetstackImpl] // actually a *netstack.Impl
 	DriveForLocal  SubSystem[drive.FileSystemForLocal]
 	DriveForRemote SubSystem[drive.FileSystemForRemote]
+	PolicyClient   SubSystem[policyclient.Client]
+	HealthTracker  SubSystem[*health.Tracker]
 
 	// InitialConfig is initial server config, if any.
 	// It is nil if the node is not in declarative mode.
@@ -72,22 +75,37 @@ type System struct {
 	controlKnobs controlknobs.Knobs
 	proxyMap     proxymap.Mapper
 
-	healthTracker       health.Tracker
 	userMetricsRegistry usermetric.Registry
 }
 
 // NewSystem constructs a new otherwise-empty [System] with a
 // freshly-constructed event bus populated.
-func NewSystem() *System {
+func NewSystem() *System { return NewSystemWithBus(eventbus.New()) }
+
+// NewSystemWithBus constructs a new otherwise-empty [System] with an
+// eventbus provided by the caller. The provided bus must not be nil.
+// This is mainly intended for testing; for production use call [NewBus].
+func NewSystemWithBus(bus *eventbus.Bus) *System {
+	if bus == nil {
+		panic("nil eventbus")
+	}
 	sys := new(System)
-	sys.Set(eventbus.New())
+	sys.Set(bus)
+
+	tracker := health.NewTracker(bus)
+	sys.Set(tracker)
+
 	return sys
 }
+
+// LocalBackend is a fake name for *ipnlocal.LocalBackend to avoid an import cycle.
+type LocalBackend = any
 
 // NetstackImpl is the interface that *netstack.Impl implements.
 // It's an interface for circular dependency reasons: netstack.Impl
 // references LocalBackend, and LocalBackend has a tsd.System.
 type NetstackImpl interface {
+	Start(LocalBackend) error
 	UpdateNetstackIPs(*netmap.NetworkMap)
 }
 
@@ -126,6 +144,10 @@ func (s *System) Set(v any) {
 		s.DriveForLocal.Set(v)
 	case drive.FileSystemForRemote:
 		s.DriveForRemote.Set(v)
+	case policyclient.Client:
+		s.PolicyClient.Set(v)
+	case *health.Tracker:
+		s.HealthTracker.Set(v)
 	default:
 		panic(fmt.Sprintf("unknown type %T", v))
 	}
@@ -155,14 +177,18 @@ func (s *System) ProxyMapper() *proxymap.Mapper {
 	return &s.proxyMap
 }
 
-// HealthTracker returns the system health tracker.
-func (s *System) HealthTracker() *health.Tracker {
-	return &s.healthTracker
-}
-
 // UserMetricsRegistry returns the system usermetrics.
 func (s *System) UserMetricsRegistry() *usermetric.Registry {
 	return &s.userMetricsRegistry
+}
+
+// PolicyClientOrDefault returns the policy client if set or a no-op default
+// otherwise. It always returns a non-nil value.
+func (s *System) PolicyClientOrDefault() policyclient.Client {
+	if client, ok := s.PolicyClient.GetOK(); ok {
+		return client
+	}
+	return policyclient.Get()
 }
 
 // SubSystem represents some subsystem of the Tailscale node daemon.

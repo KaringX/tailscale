@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/sagernet/tailscale/feature/buildfeatures"
 	"github.com/sagernet/tailscale/ipn"
 	"github.com/sagernet/tailscale/ipn/ipnauth"
 	"github.com/sagernet/tailscale/types/logger"
@@ -145,7 +146,11 @@ func (a *actor) Username() (string, error) {
 		defer tok.Close()
 		return tok.Username()
 	case "darwin", "linux", "illumos", "solaris", "openbsd":
-		uid, ok := a.ci.Creds().UserID()
+		creds := a.ci.Creds()
+		if creds == nil {
+			return "", errors.New("peer credentials not implemented on this OS")
+		}
+		uid, ok := creds.UserID()
 		if !ok {
 			return "", errors.New("missing user ID")
 		}
@@ -233,6 +238,11 @@ func connIsLocalAdmin(logf logger.Logf, ci *ipnauth.ConnIdentity, operatorUID st
 		// Linux.
 		fallthrough
 	case "linux":
+		if !buildfeatures.HasUnixSocketIdentity {
+			// Everybody is an admin if support for unix socket identities
+			// is omitted for the build.
+			return true
+		}
 		uid, ok := ci.Creds().UserID()
 		if !ok {
 			return false

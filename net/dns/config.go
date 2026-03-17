@@ -1,6 +1,8 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+//go:generate go run tailscale.com/cmd/viewer --type=Config --clonefunc
+
 // Package dns contains code to configure and manage DNS settings.
 package dns
 
@@ -8,6 +10,8 @@ import (
 	"bufio"
 	"fmt"
 	"net/netip"
+	"reflect"
+	"slices"
 	"sort"
 
 	"github.com/sagernet/tailscale/control/controlknobs"
@@ -181,21 +185,16 @@ func sameResolverNames(a, b []*dnstype.Resolver) bool {
 		if a[i].Addr != b[i].Addr {
 			return false
 		}
-		if !sameIPs(a[i].BootstrapResolution, b[i].BootstrapResolution) {
+		if !slices.Equal(a[i].BootstrapResolution, b[i].BootstrapResolution) {
 			return false
 		}
 	}
 	return true
 }
 
-func sameIPs(a, b []netip.Addr) bool {
-	if len(a) != len(b) {
-		return false
+func (c *Config) Equal(o *Config) bool {
+	if c == nil || o == nil {
+		return c == o
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return reflect.DeepEqual(c, o)
 }

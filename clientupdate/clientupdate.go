@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/sagernet/tailscale/feature"
 	"github.com/sagernet/tailscale/hostinfo"
 	"github.com/sagernet/tailscale/types/lazy"
 	"github.com/sagernet/tailscale/types/logger"
@@ -252,9 +253,13 @@ func (up *Updater) getUpdateFunction() (fn updateFunction, canAutoUpdate bool) {
 
 var canAutoUpdateCache lazy.SyncValue[bool]
 
-// CanAutoUpdate reports whether auto-updating via the clientupdate package
+func init() {
+	feature.HookCanAutoUpdate.Set(canAutoUpdate)
+}
+
+// canAutoUpdate reports whether auto-updating via the clientupdate package
 // is supported for the current os/distro.
-func CanAutoUpdate() bool { return canAutoUpdateCache.Get(canAutoUpdateUncached) }
+func canAutoUpdate() bool { return canAutoUpdateCache.Get(canAutoUpdateUncached) }
 
 func canAutoUpdateUncached() bool {
 	if version.IsMacSysExt() {
@@ -413,13 +418,13 @@ func parseSynoinfo(path string) (string, error) {
 	// Extract the CPU in the middle (88f6282 in the above example).
 	s := bufio.NewScanner(f)
 	for s.Scan() {
-		l := s.Text()
-		if !strings.HasPrefix(l, "unique=") {
+		line := s.Text()
+		if !strings.HasPrefix(line, "unique=") {
 			continue
 		}
-		parts := strings.SplitN(l, "_", 3)
+		parts := strings.SplitN(line, "_", 3)
 		if len(parts) != 3 {
-			return "", fmt.Errorf(`malformed %q: found %q, expected format like 'unique="synology_$cpu_$model'`, path, l)
+			return "", fmt.Errorf(`malformed %q: found %q, expected format like 'unique="synology_$cpu_$model'`, path, line)
 		}
 		return parts[1], nil
 	}

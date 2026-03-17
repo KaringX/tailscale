@@ -17,7 +17,8 @@ import (
 
 	"github.com/sagernet/tailscale/tailcfg"
 	"github.com/sagernet/tailscale/types/key"
-	"github.com/sagernet/tailscale/util/syspolicy"
+	"github.com/sagernet/tailscale/util/syspolicy/pkey"
+	"github.com/sagernet/tailscale/util/syspolicy/policyclient"
 	"github.com/tailscale/certstore"
 )
 
@@ -30,8 +31,8 @@ import (
 // each RegisterRequest will be unsigned.
 //
 // Example: "CN=Tailscale Inc Test Root CA,OU=Tailscale Inc Test Certificate Authority,O=Tailscale Inc,ST=ON,C=CA"
-func getMachineCertificateSubject() string {
-	machineCertSubject, _ := syspolicy.GetString(syspolicy.MachineCertificateSubject, "")
+func getMachineCertificateSubject(polc policyclient.Client) string {
+	machineCertSubject, _ := polc.GetString(pkey.MachineCertificateSubject, "")
 	return machineCertSubject
 }
 
@@ -136,7 +137,7 @@ func findIdentity(subject string, st certstore.Store) (certstore.Identity, []*x5
 // using that identity's public key. In addition to the signature, the full
 // certificate chain is included so that the control server can validate the
 // certificate from a copy of the root CA's certificate.
-func signRegisterRequest(req *tailcfg.RegisterRequest, serverURL string, serverPubKey, machinePubKey key.MachinePublic) (err error) {
+func signRegisterRequest(polc policyclient.Client, req *tailcfg.RegisterRequest, serverURL string, serverPubKey, machinePubKey key.MachinePublic) (err error) {
 	defer func() {
 		if err != nil {
 			err = fmt.Errorf("signRegisterRequest: %w", err)
@@ -147,7 +148,7 @@ func signRegisterRequest(req *tailcfg.RegisterRequest, serverURL string, serverP
 		return errBadRequest
 	}
 
-	machineCertificateSubject := getMachineCertificateSubject()
+	machineCertificateSubject := getMachineCertificateSubject(polc)
 	if machineCertificateSubject == "" {
 		return errCertificateNotConfigured
 	}

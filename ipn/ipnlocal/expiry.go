@@ -6,12 +6,14 @@ package ipnlocal
 import (
 	"time"
 
+	"github.com/sagernet/tailscale/control/controlclient"
 	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/tailcfg"
 	"github.com/sagernet/tailscale/tstime"
 	"github.com/sagernet/tailscale/types/key"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/types/netmap"
+	"github.com/sagernet/tailscale/util/eventbus"
 )
 
 // For extra defense-in-depth, when we're testing expired nodes we check
@@ -40,14 +42,22 @@ type expiryManager struct {
 
 	logf  logger.Logf
 	clock tstime.Clock
+
+	eventClient *eventbus.Client
 }
 
-func newExpiryManager(logf logger.Logf) *expiryManager {
-	return &expiryManager{
+func newExpiryManager(logf logger.Logf, bus *eventbus.Bus) *expiryManager {
+	em := &expiryManager{
 		previouslyExpired: map[tailcfg.StableNodeID]bool{},
 		logf:              logf,
 		clock:             tstime.StdClock{},
 	}
+
+	em.eventClient = bus.Client("ipnlocal.expiryManager")
+	eventbus.SubscribeFunc(em.eventClient, func(ct controlclient.ControlTime) {
+		em.onControlTime(ct.Value)
+	})
+	return em
 }
 
 // onControlTime is called whenever we receive a new timestamp from the control
@@ -217,6 +227,8 @@ func (em *expiryManager) nextPeerExpiry(nm *netmap.NetworkMap, localNow time.Tim
 
 	return nextExpiry
 }
+
+func (em *expiryManager) close() { em.eventClient.Close() }
 
 // ControlNow estimates the current time on the control server, calculated as
 // localNow + the delta between local and control server clocks as recorded

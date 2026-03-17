@@ -11,11 +11,13 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/types/lazy"
 	"github.com/sagernet/tailscale/util/syspolicy/internal"
+	"github.com/sagernet/tailscale/util/syspolicy/pkey"
+	"github.com/sagernet/tailscale/util/syspolicy/ptype"
 	"github.com/sagernet/tailscale/util/testenv"
 )
 
@@ -129,12 +131,12 @@ func (t Type) String() string {
 
 // ValueType is a constraint that allows Go types corresponding to [Type].
 type ValueType interface {
-	bool | uint64 | string | []string | Visibility | PreferenceOption | time.Duration
+	bool | uint64 | string | []string | ptype.Visibility | ptype.PreferenceOption | time.Duration
 }
 
 // Definition defines policy key, scope and value type.
 type Definition struct {
-	key       Key
+	key       pkey.Key
 	scope     Scope
 	typ       Type
 	platforms PlatformList
@@ -142,12 +144,12 @@ type Definition struct {
 
 // NewDefinition returns a new [Definition] with the specified
 // key, scope, type and supported platforms (see [PlatformList]).
-func NewDefinition(k Key, s Scope, t Type, platforms ...string) *Definition {
+func NewDefinition(k pkey.Key, s Scope, t Type, platforms ...string) *Definition {
 	return &Definition{key: k, scope: s, typ: t, platforms: platforms}
 }
 
 // Key returns a policy setting's identifier.
-func (d *Definition) Key() Key {
+func (d *Definition) Key() pkey.Key {
 	if d == nil {
 		return ""
 	}
@@ -208,12 +210,12 @@ func (d *Definition) Equal(d2 *Definition) bool {
 }
 
 // DefinitionMap is a map of setting [Definition] by [Key].
-type DefinitionMap map[Key]*Definition
+type DefinitionMap map[pkey.Key]*Definition
 
 var (
 	definitions lazy.SyncValue[DefinitionMap]
 
-	definitionsMu   sync.Mutex
+	definitionsMu   syncs.Mutex
 	definitionsList []*Definition
 	definitionsUsed bool
 )
@@ -224,7 +226,7 @@ var (
 // invoking any functions that use the registered policy definitions. This
 // includes calling [Definitions] or [DefinitionOf] directly, or reading any
 // policy settings via syspolicy.
-func Register(k Key, s Scope, t Type, platforms ...string) {
+func Register(k pkey.Key, s Scope, t Type, platforms ...string) {
 	RegisterDefinition(NewDefinition(k, s, t, platforms...))
 }
 
@@ -290,7 +292,7 @@ func SetDefinitionsForTest(tb testenv.TB, ds ...*Definition) error {
 // DefinitionOf returns a setting definition by key,
 // or [ErrNoSuchKey] if the specified key does not exist,
 // or an error if there are conflicting policy definitions.
-func DefinitionOf(k Key) (*Definition, error) {
+func DefinitionOf(k pkey.Key) (*Definition, error) {
 	ds, err := settingDefinitions()
 	if err != nil {
 		return nil, err
@@ -320,33 +322,33 @@ func Definitions() ([]*Definition, error) {
 type PlatformList []string
 
 // Has reports whether l contains the target platform.
-func (l PlatformList) Has(target string) bool {
-	if len(l) == 0 {
+func (ls PlatformList) Has(target string) bool {
+	if len(ls) == 0 {
 		return true
 	}
-	return slices.ContainsFunc(l, func(os string) bool {
+	return slices.ContainsFunc(ls, func(os string) bool {
 		return strings.EqualFold(os, target)
 	})
 }
 
 // HasCurrent is like Has, but for the current platform.
-func (l PlatformList) HasCurrent() bool {
-	return l.Has(internal.OS())
+func (ls PlatformList) HasCurrent() bool {
+	return ls.Has(internal.OS())
 }
 
 // mergeFrom merges l2 into l. Since an empty list indicates no platform restrictions,
 // if either l or l2 is empty, the merged result in l will also be empty.
-func (l *PlatformList) mergeFrom(l2 PlatformList) {
+func (ls *PlatformList) mergeFrom(l2 PlatformList) {
 	switch {
-	case len(*l) == 0:
+	case len(*ls) == 0:
 		// No-op. An empty list indicates no platform restrictions.
 	case len(l2) == 0:
 		// Merging with an empty list results in an empty list.
-		*l = l2
+		*ls = l2
 	default:
 		// Append, sort and dedup.
-		*l = append(*l, l2...)
-		slices.Sort(*l)
-		*l = slices.Compact(*l)
+		*ls = append(*ls, l2...)
+		slices.Sort(*ls)
+		*ls = slices.Compact(*ls)
 	}
 }

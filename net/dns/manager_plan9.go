@@ -21,9 +21,10 @@ import (
 	"github.com/sagernet/tailscale/health"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/util/set"
+	"github.com/sagernet/tailscale/util/syspolicy/policyclient"
 )
 
-func NewOSConfigurator(logf logger.Logf, ht *health.Tracker, knobs *controlknobs.Knobs, interfaceName string) (OSConfigurator, error) {
+func NewOSConfigurator(logf logger.Logf, ht *health.Tracker, _ policyclient.Client, knobs *controlknobs.Knobs, interfaceName string) (OSConfigurator, error) {
 	return &plan9DNSManager{
 		logf:  logf,
 		ht:    ht,

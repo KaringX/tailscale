@@ -54,7 +54,7 @@ import (
 	"time"
 
 	"github.com/hdevalence/ed25519consensus"
-	"github.com/sagernet/tailscale/net/tshttpproxy"
+	"github.com/sagernet/tailscale/feature"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/util/httpm"
 	"github.com/sagernet/tailscale/util/must"
@@ -330,7 +330,7 @@ func fetch(url string, limit int64) ([]byte, error) {
 // limit bytes. On success, the returned value is a BLAKE2s hash of the file.
 func (c *Client) download(ctx context.Context, url, dst string, limit int64) ([]byte, int64, error) {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.Proxy = tshttpproxy.ProxyFromEnvironment
+	tr.Proxy = feature.HookProxyFromEnvironment.GetOrNil()
 	defer tr.CloseIdleConnections()
 	hc := &http.Client{Transport: tr}
 

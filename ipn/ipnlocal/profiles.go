@@ -13,14 +13,18 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/sagernet/tailscale/clientupdate"
 	"github.com/sagernet/tailscale/envknob"
+	"github.com/sagernet/tailscale/feature"
 	"github.com/sagernet/tailscale/health"
 	"github.com/sagernet/tailscale/ipn"
 	"github.com/sagernet/tailscale/ipn/ipnext"
 	"github.com/sagernet/tailscale/tailcfg"
+	"github.com/sagernet/tailscale/types/key"
 	"github.com/sagernet/tailscale/types/logger"
+	"github.com/sagernet/tailscale/types/persist"
 	"github.com/sagernet/tailscale/util/clientmetric"
+	"github.com/sagernet/tailscale/util/eventbus"
+	"github.com/sagernet/tailscale/util/testenv"
 )
 
 var debug = envknob.RegisterBool("TS_DEBUG_PROFILES")
@@ -644,8 +648,8 @@ func (pm *profileManager) setProfileAsUserDefault(profile ipn.LoginProfileView) 
 	return pm.WriteState(k, []byte(profile.Key()))
 }
 
-func (pm *profileManager) loadSavedPrefs(key ipn.StateKey) (ipn.PrefsView, error) {
-	bs, err := pm.store.ReadState(key)
+func (pm *profileManager) loadSavedPrefs(k ipn.StateKey) (ipn.PrefsView, error) {
+	bs, err := pm.store.ReadState(k)
 	if err == ipn.ErrStateNotExist || len(bs) == 0 {
 		return defaultPrefs, nil
 	}
@@ -653,10 +657,18 @@ func (pm *profileManager) loadSavedPrefs(key ipn.StateKey) (ipn.PrefsView, error
 		return ipn.PrefsView{}, err
 	}
 	savedPrefs := ipn.NewPrefs()
+
+	// if supported by the platform, create an empty hardware attestation key to use when deserializing
+	// to avoid type exceptions from json.Unmarshaling into an interface{}.
+	hw, _ := key.NewEmptyHardwareAttestationKey()
+	savedPrefs.Persist = &persist.Persist{
+		AttestationKey: hw,
+	}
+
 	if err := ipn.PrefsFromBytes(bs, savedPrefs); err != nil {
 		return ipn.PrefsView{}, fmt.Errorf("parsing saved prefs: %v", err)
 	}
-	pm.logf("using backend prefs for %q: %v", key, savedPrefs.Pretty())
+	pm.logf("using backend prefs for %q: %v", k, savedPrefs.Pretty())
 
 	// Ignore any old stored preferences for https://login.tailscale.com
 	// as the control server that would override the new default of
@@ -673,7 +685,7 @@ func (pm *profileManager) loadSavedPrefs(key ipn.StateKey) (ipn.PrefsView, error
 	// cause any EditPrefs calls to fail (other than disabling auto-updates).
 	//
 	// Reset AutoUpdate.Apply if we detect such invalid prefs.
-	if savedPrefs.AutoUpdate.Apply.EqualBool(true) && !clientupdate.CanAutoUpdate() {
+	if savedPrefs.AutoUpdate.Apply.EqualBool(true) && !feature.CanAutoUpdate() {
 		savedPrefs.AutoUpdate.Apply.Clear()
 	}
 
@@ -838,7 +850,10 @@ func (pm *profileManager) CurrentPrefs() ipn.PrefsView {
 
 // ReadStartupPrefsForTest reads the startup prefs from disk. It is only used for testing.
 func ReadStartupPrefsForTest(logf logger.Logf, store ipn.StateStore) (ipn.PrefsView, error) {
-	ht := new(health.Tracker) // in tests, don't care about the health status
+	testenv.AssertInTest()
+	bus := eventbus.New()
+	defer bus.Close()
+	ht := health.NewTracker(bus) // in tests, don't care about the health status
 	pm, err := newProfileManager(store, logf, ht)
 	if err != nil {
 		return ipn.PrefsView{}, err

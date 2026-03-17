@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
 
 	"github.com/sagernet/tailscale/atomicfile"
 )
@@ -68,8 +69,13 @@ func main() {
 				fmt.Fprintf(os.Stderr, "usage: gocross write-wrapper-script <path>\n")
 				os.Exit(1)
 			}
-			if err := atomicfile.WriteFile(os.Args[2], wrapperScript, 0o755); err != nil {
-				fmt.Fprintf(os.Stderr, "writing wrapper script: %v\n", err)
+			if err := atomicfile.WriteFile(os.Args[2], wrapperScriptBash, 0o755); err != nil {
+				fmt.Fprintf(os.Stderr, "writing bash wrapper script: %v\n", err)
+				os.Exit(1)
+			}
+			psFileName := strings.TrimSuffix(os.Args[2], filepath.Ext(os.Args[2])) + ".ps1"
+			if err := atomicfile.WriteFile(psFileName, wrapperScriptPowerShell, 0o644); err != nil {
+				fmt.Fprintf(os.Stderr, "writing PowerShell wrapper script: %v\n", err)
 				os.Exit(1)
 			}
 			os.Exit(0)
@@ -108,11 +114,18 @@ func main() {
 
 	}
 
-	doExec(filepath.Join(toolchain, "bin/go"), args, os.Environ())
+	// Note that doExec only returns if the exec call failed.
+	if err := doExec(filepath.Join(toolchain, "bin", "go"), args, os.Environ()); err != nil {
+		fmt.Fprintf(os.Stderr, "executing process: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 //go:embed gocross-wrapper.sh
-var wrapperScript []byte
+var wrapperScriptBash []byte
+
+//go:embed gocross-wrapper.ps1
+var wrapperScriptPowerShell []byte
 
 func debugf(format string, args ...any) {
 	debug := os.Getenv("GOCROSS_DEBUG")

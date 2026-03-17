@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/sagernet/tailscale/net/netmon"
+	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/tailcfg"
 	"github.com/sagernet/tailscale/types/logger"
 )
@@ -32,7 +33,7 @@ type Detector struct {
 	// currIfIndex is the index of the interface that is currently being used by the httpClient.
 	currIfIndex int
 	// mu guards currIfIndex.
-	mu sync.Mutex
+	mu syncs.Mutex
 	// logf is the logger used for logging messages. If it is nil, log.Printf is used.
 	logf logger.Logf
 }

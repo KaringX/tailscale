@@ -15,6 +15,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -29,7 +30,6 @@ import (
 
 	"github.com/sagernet/tailscale/kube/kubeapi"
 	"github.com/sagernet/tailscale/tstime"
-	"github.com/sagernet/tailscale/util/multierr"
 )
 
 const (
@@ -397,7 +397,7 @@ func (c *client) CheckSecretPermissions(ctx context.Context, secretName string) 
 		}
 	}
 	if len(errs) > 0 {
-		return false, false, multierr.New(errs...)
+		return false, false, errors.Join(errs...)
 	}
 	canPatch, err = c.checkPermission(ctx, "patch", TypeSecrets, secretName)
 	if err != nil {

@@ -1,6 +1,8 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+//go:build linux && !ts_omit_listenrawdisco
+
 package magicsock
 
 import (
@@ -13,7 +15,6 @@ import (
 	"net"
 	"net/netip"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/mdlayher/socket"
@@ -23,7 +24,6 @@ import (
 	"github.com/sagernet/tailscale/types/ipproto"
 	"github.com/sagernet/tailscale/types/key"
 	"github.com/sagernet/tailscale/types/logger"
-	"github.com/sagernet/tailscale/types/nettype"
 	"golang.org/x/net/bpf"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -486,39 +486,4 @@ func printSockaddr(sa unix.Sockaddr) string {
 	default:
 		return fmt.Sprintf("unknown(%T)", sa)
 	}
-}
-
-// trySetSocketBuffer attempts to set SO_SNDBUFFORCE and SO_RECVBUFFORCE which
-// can overcome the limit of net.core.{r,w}mem_max, but require CAP_NET_ADMIN.
-// It falls back to the portable implementation if that fails, which may be
-// silently capped to net.core.{r,w}mem_max.
-func trySetSocketBuffer(pconn nettype.PacketConn, logf logger.Logf) {
-	if c, ok := pconn.(*net.UDPConn); ok {
-		var errRcv, errSnd error
-		rc, err := c.SyscallConn()
-		if err == nil {
-			rc.Control(func(fd uintptr) {
-				errRcv = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUFFORCE, socketBufferSize)
-				if errRcv != nil {
-					logf("magicsock: [warning] failed to force-set UDP read buffer size to %d: %v; using kernel default values (impacts throughput only)", socketBufferSize, errRcv)
-				}
-				errSnd = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUFFORCE, socketBufferSize)
-				if errSnd != nil {
-					logf("magicsock: [warning] failed to force-set UDP write buffer size to %d: %v; using kernel default values (impacts throughput only)", socketBufferSize, errSnd)
-				}
-			})
-		}
-
-		if err != nil || errRcv != nil || errSnd != nil {
-			portableTrySetSocketBuffer(pconn, logf)
-		}
-	}
-}
-
-var controlMessageSize = -1 // bomb if used for allocation before init
-
-func init() {
-	// controlMessageSize is set to hold a UDP_GRO or UDP_SEGMENT control
-	// message. These contain a single uint16 of data.
-	controlMessageSize = unix.CmsgSpace(2)
 }

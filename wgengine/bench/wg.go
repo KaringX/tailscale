@@ -37,7 +37,6 @@ func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netip.
 	k1 := key.NewNode()
 
 	c1 := wgcfg.Config{
-		Name:       "e1",
 		PrivateKey: k1,
 		Addresses:  []netip.Prefix{a1},
 	}
@@ -52,7 +51,7 @@ func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netip.
 		ListenPort:    0,
 		Tun:           t1,
 		SetSubsystem:  s1.Set,
-		HealthTracker: s1.HealthTracker(),
+		HealthTracker: s1.HealthTracker.Get(),
 	})
 	if err != nil {
 		log.Fatalf("e1 init: %v", err)
@@ -64,7 +63,6 @@ func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netip.
 	l2 := logger.WithPrefix(logf, "e2: ")
 	k2 := key.NewNode()
 	c2 := wgcfg.Config{
-		Name:       "e2",
 		PrivateKey: k2,
 		Addresses:  []netip.Prefix{a2},
 	}
@@ -79,7 +77,7 @@ func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netip.
 		ListenPort:    0,
 		Tun:           t2,
 		SetSubsystem:  s2.Set,
-		HealthTracker: s2.HealthTracker(),
+		HealthTracker: s2.HealthTracker.Get(),
 	})
 	if err != nil {
 		log.Fatalf("e2 init: %v", err)
@@ -112,9 +110,8 @@ func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netip.
 			Endpoints:  epFromTyped(st.LocalAddrs),
 		}
 		e2.SetNetworkMap(&netmap.NetworkMap{
-			NodeKey:    k2.Public(),
-			PrivateKey: k2,
-			Peers:      []tailcfg.NodeView{n.View()},
+			NodeKey: k2.Public(),
+			Peers:   []tailcfg.NodeView{n.View()},
 		})
 
 		p := wgcfg.Peer{
@@ -144,9 +141,8 @@ func setupWGTest(b *testing.B, logf logger.Logf, traf *TrafficGen, a1, a2 netip.
 			Endpoints:  epFromTyped(st.LocalAddrs),
 		}
 		e1.SetNetworkMap(&netmap.NetworkMap{
-			NodeKey:    k1.Public(),
-			PrivateKey: k1,
-			Peers:      []tailcfg.NodeView{n.View()},
+			NodeKey: k1.Public(),
+			Peers:   []tailcfg.NodeView{n.View()},
 		})
 
 		p := wgcfg.Peer{

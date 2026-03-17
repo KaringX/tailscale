@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/types/key"
 	"golang.org/x/crypto/blake2s"
 	chp "golang.org/x/crypto/chacha20poly1305"
@@ -48,7 +49,7 @@ type Conn struct {
 
 // rxState is all the Conn state that Read uses.
 type rxState struct {
-	sync.Mutex
+	syncs.Mutex
 	cipher    cipher.AEAD
 	nonce     nonce
 	buf       *maxMsgBuffer   // or nil when reads exhausted

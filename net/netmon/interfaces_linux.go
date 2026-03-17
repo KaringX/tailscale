@@ -20,6 +20,7 @@ import (
 
 	"github.com/jsimonetti/rtnetlink"
 	"github.com/mdlayher/netlink"
+	"github.com/sagernet/tailscale/feature/buildfeatures"
 	"github.com/sagernet/tailscale/net/netaddr"
 	"github.com/sagernet/tailscale/util/lineiter"
 	"go4.org/mem"
@@ -41,6 +42,9 @@ ens18   00000000        0100000A        0003    0       0       0       00000000
 ens18   0000000A        00000000        0001    0       0       0       0000FFFF        0       0       0
 */
 func likelyHomeRouterIPLinux() (ret netip.Addr, myIP netip.Addr, ok bool) {
+	if !buildfeatures.HasPortMapper {
+		return
+	}
 	if procNetRouteErr.Load() {
 		// If we failed to read /proc/net/route previously, don't keep trying.
 		return ret, myIP, false

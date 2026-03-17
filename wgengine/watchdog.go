@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !js
+//go:build !js && !ts_omit_debug
 
 package wgengine
 
@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sagernet/tailscale/envknob"
+	"github.com/sagernet/tailscale/feature/buildfeatures"
 	"github.com/sagernet/tailscale/ipn/ipnstate"
 	"github.com/sagernet/tailscale/net/dns"
 	"github.com/sagernet/tailscale/net/packet"
@@ -124,6 +125,13 @@ func (e *watchdogEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, d
 	return e.watchdogErr("Reconfig", func() error { return e.wrap.Reconfig(cfg, routerCfg, dnsCfg) })
 }
 
+func (e *watchdogEngine) ResetAndStop() (st *Status, err error) {
+	e.watchdog("ResetAndStop", func() {
+		st, err = e.wrap.ResetAndStop()
+	})
+	return st, err
+}
+
 func (e *watchdogEngine) GetFilter() *filter.Filter {
 	return e.wrap.GetFilter()
 }
@@ -174,6 +182,9 @@ func (e *watchdogEngine) Done() <-chan struct{} {
 }
 
 func (e *watchdogEngine) InstallCaptureHook(cb packet.CaptureCallback) {
+	if !buildfeatures.HasCapture {
+		return
+	}
 	e.wrap.InstallCaptureHook(cb)
 }
 

@@ -14,9 +14,10 @@ import (
 	"errors"
 
 	"github.com/sagernet/tailscale/types/logger"
+	"github.com/sagernet/tailscale/util/syspolicy/policyclient"
 )
 
 // GetSerialNumber returns client machine serial number(s).
-func GetSerialNumbers(_ logger.Logf) ([]string, error) {
+func GetSerialNumbers(polc policyclient.Client, _ logger.Logf) ([]string, error) {
 	return nil, errors.New("not implemented")
 }

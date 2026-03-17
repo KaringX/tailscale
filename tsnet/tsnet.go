@@ -28,10 +28,15 @@ import (
 
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/tailscale/client/local"
-	"github.com/sagernet/tailscale/client/tailscale"
 	"github.com/sagernet/tailscale/control/controlclient"
 	"github.com/sagernet/tailscale/envknob"
+	_ "github.com/sagernet/tailscale/feature/c2n"
+	_ "github.com/sagernet/tailscale/feature/condregister/osrouter"
+	_ "github.com/sagernet/tailscale/feature/condregister/oauthkey"
+	_ "github.com/sagernet/tailscale/feature/condregister/portmapper"
+	_ "github.com/sagernet/tailscale/feature/condregister/useproxy"
 	"github.com/sagernet/tailscale/health"
+	"github.com/sagernet/tailscale/internal/client/tailscale"
 	"github.com/sagernet/tailscale/ipn"
 	"github.com/sagernet/tailscale/ipn/ipnauth"
 	"github.com/sagernet/tailscale/ipn/ipnlocal"
@@ -60,6 +65,8 @@ import (
 	"github.com/sagernet/tailscale/util/testenv"
 	"github.com/sagernet/tailscale/wgengine"
 	"github.com/sagernet/tailscale/wgengine/netstack"
+	"github.com/sagernet/tailscale/wgengine/router"
+	wgTun "github.com/sagernet/wireguard-go/tun"
 )
 
 // Server is an embedded Tailscale server.
@@ -126,10 +133,19 @@ type Server struct {
 	// field at zero unless you know what you are doing.
 	Port uint16
 
+	// AdvertiseTags specifies tags that should be applied to this node, for
+	// purposes of ACL enforcement. These can be referenced from the ACL policy
+	// document. Note that advertising a tag on the client doesn't guarantee
+	// that the control server will allow the node to adopt that tag.
+	AdvertiseTags []string
+
 	Dialer     N.Dialer
 	LookupHook dnscache.LookupHookFunc
+	OnlyTCP443 bool
 	DNS        dns.OSConfigurator
 	HTTPClient *http.Client
+	TunDevice  wgTun.Device
+	Router     router.Router
 
 	getCertForTesting func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 
@@ -269,7 +285,14 @@ func (s *Server) Loopback() (addr string, proxyCred, localAPICred string, err er
 		// out the CONNECT code from tailscaled/proxy.go that uses
 		// httputil.ReverseProxy and adding auth support.
 		go func() {
-			lah := localapi.NewHandler(ipnauth.Self, s.lb, s.logf, s.logid, s.netMon.Dialer())
+			lah := localapi.NewHandler(localapi.HandlerConfig{
+				Actor:    ipnauth.Self,
+				Backend:  s.lb,
+				Logf:     s.logf,
+				LogID:    s.logid,
+				EventBus: s.sys.Bus.Get(),
+				Dialer:   s.netMon.Dialer(),
+			})
 			lah.PermitWrite = true
 			lah.PermitRead = true
 			lah.RequiredPassword = s.localAPICred
@@ -328,7 +351,7 @@ func (s *Server) Up(ctx context.Context) (*ipnstate.Status, error) {
 		return nil, fmt.Errorf("tsnet.Up: %w", err)
 	}
 
-	watcher, err := lc.WatchIPNBus(ctx, ipn.NotifyInitialState|ipn.NotifyNoPrivateKeys)
+	watcher, err := lc.WatchIPNBus(ctx, ipn.NotifyInitialState)
 	if err != nil {
 		return nil, fmt.Errorf("tsnet.Up: %w", err)
 	}
@@ -429,10 +452,7 @@ func (s *Server) Close() error {
 		ln.closeLocked()
 	}
 	wg.Wait()
-
-	if bus := s.sys.Bus.Get(); bus != nil {
-		bus.Close()
-	}
+	s.sys.Bus.Get().Close()
 	s.closed = true
 	return nil
 }
@@ -476,6 +496,16 @@ func (s *Server) TailscaleIPs() (ip4, ip6 netip.Addr) {
 	}
 
 	return ip4, ip6
+}
+
+// LogtailWriter returns an [io.Writer] that writes to Tailscale's logging service and will be only visible to Tailscale's
+// support team. Logs written there cannot be retrieved by the user. This method always returns a non-nil value.
+func (s *Server) LogtailWriter() io.Writer {
+	if s.logtail == nil {
+		return io.Discard
+	}
+
+	return s.logtail
 }
 
 func (s *Server) getAuthKey() string {
@@ -548,12 +578,17 @@ func (s *Server) start() (reterr error) {
 		if s.Logf == nil {
 			return
 		}
-		s.Logf(format, a...)
+		// Format the log message and remove the [v\x00JSON] prefix
+		// that is used internally by logtail for structured logging.
+		// See: https://github.com/SagerNet/sing-box/issues/3481
+		msg := fmt.Sprintf(format, a...)
+		msg = removeJSONLogPrefix(msg)
+		s.Logf("%s", msg)
 	}
 
 	sys := tsd.NewSystem()
 	s.sys = sys
-	if err := s.startLogger(&closePool, sys.HealthTracker(), tsLogf); err != nil {
+	if err := s.startLogger(&closePool, sys.HealthTracker.Get(), tsLogf); err != nil {
 		return err
 	}
 
@@ -564,23 +599,37 @@ func (s *Server) start() (reterr error) {
 	closePool.add(s.netMon)
 
 	s.dialer = &tsdial.Dialer{Logf: tsLogf, Dialer: s.Dialer} // mutated below (before used)
-	eng, err := wgengine.NewUserspaceEngine(tsLogf, wgengine.Config{
-		EventBus:      sys.Bus.Get(),
+	s.dialer.SetBus(sys.Bus.Get())
+	engineConfig := wgengine.Config{
 		DNS:           s.DNS,
+		EventBus:      sys.Bus.Get(),
 		ListenPort:    s.Port,
 		NetMon:        s.netMon,
 		Dialer:        s.dialer,
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
-		HealthTracker: sys.HealthTracker(),
+		HealthTracker: sys.HealthTracker.Get(),
 		Metrics:       sys.UserMetricsRegistry(),
-	})
+	}
+	if s.TunDevice != nil {
+		engineConfig.Tun = s.TunDevice
+		if s.Router != nil {
+			engineConfig.Router = s.Router
+		} else {
+			systemRouter, err := router.New(tsLogf, s.TunDevice, s.netMon, sys.HealthTracker.Get(), sys.Bus.Get())
+			if err != nil {
+				return err
+			}
+			engineConfig.Router = systemRouter
+		}
+	}
+	eng, err := wgengine.NewUserspaceEngine(tsLogf, engineConfig)
 	if err != nil {
 		return err
 	}
 	closePool.add(s.dialer)
 	sys.Set(eng)
-	sys.HealthTracker().SetMetricsRegistry(sys.UserMetricsRegistry())
+	sys.HealthTracker.Get().SetMetricsRegistry(sys.UserMetricsRegistry())
 
 	// TODO(oxtoacart): do we need to support Taildrive on tsnet, and if so, how?
 	ns, err := netstack.Create(tsLogf, sys.Tun.Get(), eng, sys.MagicSock.Get(), s.dialer, sys.DNSManager.Get(), sys.ProxyMapper())
@@ -637,7 +686,7 @@ func (s *Server) start() (reterr error) {
 	if s.Ephemeral {
 		loginFlags = controlclient.LoginEphemeral
 	}
-	lb, err := ipnlocal.NewLocalBackend(tsLogf, s.logid, sys, loginFlags|controlclient.LocalBackendStartKeyOSNeutral, s.LookupHook)
+	lb, err := ipnlocal.NewLocalBackend(tsLogf, s.logid, sys, loginFlags|controlclient.LocalBackendStartKeyOSNeutral, s.LookupHook, s.OnlyTCP443)
 	if err != nil {
 		return fmt.Errorf("NewLocalBackend: %v", err)
 	}
@@ -655,7 +704,16 @@ func (s *Server) start() (reterr error) {
 	prefs.WantRunning = true
 	prefs.ControlURL = s.ControlURL
 	prefs.RunWebClient = s.RunWebClient
+	prefs.AdvertiseTags = s.AdvertiseTags
 	authKey := s.getAuthKey()
+	// Try to use an OAuth secret to generate an auth key if that functionality
+	// is available.
+	if f, ok := tailscale.HookResolveAuthKey.GetOk(); ok {
+		authKey, err = f(s.shutdownCtx, s.getAuthKey(), prefs.AdvertiseTags)
+		if err != nil {
+			return fmt.Errorf("resolving auth key: %w", err)
+		}
+	}
 	err = lb.Start(ipn.Options{
 		UpdatePrefs: prefs,
 		AuthKey:     authKey,
@@ -675,7 +733,14 @@ func (s *Server) start() (reterr error) {
 	// go s.printAuthURLLoop()
 
 	// Run the localapi handler, to allow fetching LetsEncrypt certs.
-	lah := localapi.NewHandler(ipnauth.Self, lb, tsLogf, s.logid, s.netMon.Dialer())
+	lah := localapi.NewHandler(localapi.HandlerConfig{
+		Actor:    ipnauth.Self,
+		Backend:  lb,
+		Logf:     tsLogf,
+		LogID:    s.logid,
+		EventBus: sys.Bus.Get(),
+		Dialer:   s.netMon.Dialer(),
+	})
 	lah.PermitWrite = true
 	lah.PermitRead = true
 
@@ -726,6 +791,7 @@ func (s *Server) startLogger(closePool *closeOnErrorPool, health *health.Tracker
 		Stderr:       io.Discard, // log everything to Buffer
 		Buffer:       s.logbuffer,
 		CompressLogs: true,
+		Bus:          s.sys.Bus.Get(),
 		HTTPC:        &http.Client{Transport: logpolicy.NewLogtailTransport(logtail.DefaultHost, s.netMon, health, tsLogf)},
 		MetricsDelta: clientmetric.EncodeLogTailMetricsDelta,
 	}
@@ -892,60 +958,6 @@ func (s *Server) getUDPHandlerForFlow(src, dst netip.AddrPort) (handler func(net
 		return nil, true // don't handle, don't forward to localhost
 	}
 	return func(c nettype.ConnPacketConn) { ln.handle(c) }, true
-}
-
-// APIClient returns a tailscale.Client that can be used to make authenticated
-// requests to the Tailscale control server.
-// It requires the user to set tailscale.I_Acknowledge_This_API_Is_Unstable.
-//
-// Deprecated: use AuthenticatedAPITransport with tailscale.com/client/tailscale/v2 instead.
-func (s *Server) APIClient() (*tailscale.Client, error) {
-	if !tailscale.I_Acknowledge_This_API_Is_Unstable {
-		return nil, errors.New("use of Client without setting I_Acknowledge_This_API_Is_Unstable")
-	}
-	if err := s.Start(); err != nil {
-		return nil, err
-	}
-
-	c := tailscale.NewClient("-", nil)
-	c.UserAgent = "tailscale-tsnet"
-	c.HTTPClient = &http.Client{Transport: s.lb.KeyProvingNoiseRoundTripper()}
-	return c, nil
-}
-
-// I_Acknowledge_This_API_Is_Experimental must be set true to use AuthenticatedAPITransport()
-// for now.
-var I_Acknowledge_This_API_Is_Experimental = false
-
-// AuthenticatedAPITransport provides an HTTP transport that can be used with
-// the control server API without needing additional authentication details. It
-// authenticates using the current client's nodekey.
-//
-// It requires the user to set I_Acknowledge_This_API_Is_Experimental.
-//
-// For example:
-//
-//	import "net/http"
-//	import "tailscale.com/client/tailscale/v2"
-//	import "tailscale.com/tsnet"
-//
-//	var s *tsnet.Server
-//	...
-//	rt, err := s.AuthenticatedAPITransport()
-//	// handler err ...
-//	var client tailscale.Client{HTTP: http.Client{
-//	    Timeout: 1*time.Minute,
-//	    UserAgent: "your-useragent-here",
-//	    Transport: rt,
-//	}}
-func (s *Server) AuthenticatedAPITransport() (http.RoundTripper, error) {
-	if !I_Acknowledge_This_API_Is_Experimental {
-		return nil, errors.New("use of AuthenticatedAPITransport without setting I_Acknowledge_This_API_Is_Experimental")
-	}
-	if err := s.Start(); err != nil {
-		return nil, err
-	}
-	return s.lb.KeyProvingNoiseRoundTripper(), nil
 }
 
 // Listen announces only on the Tailscale network.
@@ -1271,6 +1283,12 @@ func (s *Server) listen(network, addr string, lnOn listenOn) (net.Listener, erro
 	return ln, nil
 }
 
+// GetRootPath returns the root path of the tsnet server.
+// This is where the state file and other data is stored.
+func (s *Server) GetRootPath() string {
+	return s.rootPath
+}
+
 // CapturePcap can be called by the application code compiled with tsnet to save a pcap
 // of packets which the netstack within tsnet sees. This is expected to be useful during
 // debugging, probably not useful for production.
@@ -1376,3 +1394,23 @@ type addr struct{ ln *listener }
 
 func (a addr) Network() string { return a.ln.keys[0].network }
 func (a addr) String() string  { return a.ln.addr }
+
+// vJSONPrefix is the magic prefix used by logtail for structured JSON logging.
+// The null byte (\x00) is used as a marker that logtail recognizes and strips,
+// but if the log bypasses logtail processing, it appears in the output.
+const vJSONPrefix = "[v\x00JSON]"
+
+// removeJSONLogPrefix removes the [v\x00JSON] prefix and log level digit
+// from a log message. This prefix is used internally by tailscale's logger
+// for structured logging, but should not appear in user-visible logs.
+func removeJSONLogPrefix(msg string) string {
+	if idx := strings.Index(msg, vJSONPrefix); idx != -1 {
+		rest := msg[idx+len(vJSONPrefix):]
+		if len(rest) >= 1 && rest[0] >= '0' && rest[0] <= '9' {
+			// Skip the log level digit
+			return msg[:idx] + rest[1:]
+		}
+		return msg[:idx] + rest
+	}
+	return msg
+}

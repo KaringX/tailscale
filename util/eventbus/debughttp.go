@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !ios && !android
+//go:build !ios && !android && !ts_omit_debugeventbus
 
 package eventbus
 
@@ -29,7 +29,7 @@ type httpDebugger struct {
 	*Debugger
 }
 
-func registerHTTPDebugger(d *Debugger, td *tsweb.DebugHandler) {
+func (d *Debugger) RegisterHTTP(td *tsweb.DebugHandler) {
 	dh := httpDebugger{d}
 	td.Handle("bus", "Event bus", dh)
 	td.HandleSilent("bus/monitor", http.HandlerFunc(dh.serveMonitor))

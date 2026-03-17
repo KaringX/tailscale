@@ -14,12 +14,16 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/sagernet/tailscale/feature/buildfeatures"
 	"github.com/sagernet/tailscale/tsweb"
 	"github.com/sagernet/tailscale/types/key"
 	"github.com/sagernet/tailscale/util/eventbus"
 )
 
 func main() {
+	if !buildfeatures.HasDebugEventBus {
+		log.Fatalf("debug-demo requires the \"debugeventbus\" feature enabled")
+	}
 	b := eventbus.New()
 	c := b.Client("RouteMonitor")
 	go testPub[RouteAdded](c, 5*time.Second)

@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"unsafe"
 
+	"github.com/sagernet/tailscale/feature/buildfeatures"
 	"github.com/sagernet/tailscale/tsconst"
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
@@ -22,7 +23,9 @@ const (
 
 func init() {
 	likelyHomeRouterIP = likelyHomeRouterIPWindows
-	getPAC = getPACWindows
+	if buildfeatures.HasUseProxy {
+		getPAC = getPACWindows
+	}
 }
 
 func likelyHomeRouterIPWindows() (ret netip.Addr, _ netip.Addr, ok bool) {
@@ -244,6 +247,9 @@ const (
 )
 
 func getPACWindows() string {
+	if !buildfeatures.HasUseProxy {
+		return ""
+	}
 	var res *uint16
 	r, _, e := detectAutoProxyConfigURL.Call(
 		winHTTP_AUTO_DETECT_TYPE_DHCP|winHTTP_AUTO_DETECT_TYPE_DNS_A,

@@ -7,14 +7,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"time"
-
-	"github.com/sagernet/tailscale/util/multierr"
 )
 
 const (
@@ -30,33 +29,31 @@ const (
 // The ProbeFunc connects to a hostPort (host:port string), does a TLS
 // handshake, verifies that the hostname matches the presented certificate,
 // checks certificate validity time and OCSP revocation status.
-func TLS(hostPort string) ProbeClass {
+//
+// The TLS config is optional and may be nil.
+func TLS(hostPort string, config *tls.Config) ProbeClass {
 	return ProbeClass{
 		Probe: func(ctx context.Context) error {
-			certDomain, _, err := net.SplitHostPort(hostPort)
-			if err != nil {
-				return err
-			}
-			return probeTLS(ctx, certDomain, hostPort)
+			return probeTLS(ctx, config, hostPort)
 		},
 		Class: "tls",
 	}
 }
 
-// TLSWithIP is like TLS, but dials the provided dialAddr instead
-// of using DNS resolution. The certDomain is the expected name in
-// the cert (and the SNI name to send).
-func TLSWithIP(certDomain string, dialAddr netip.AddrPort) ProbeClass {
+// TLSWithIP is like TLS, but dials the provided dialAddr instead of using DNS
+// resolution. Use config.ServerName to send SNI and validate the name in the
+// cert.
+func TLSWithIP(dialAddr netip.AddrPort, config *tls.Config) ProbeClass {
 	return ProbeClass{
 		Probe: func(ctx context.Context) error {
-			return probeTLS(ctx, certDomain, dialAddr.String())
+			return probeTLS(ctx, config, dialAddr.String())
 		},
 		Class: "tls",
 	}
 }
 
-func probeTLS(ctx context.Context, certDomain string, dialHostPort string) error {
-	dialer := &tls.Dialer{Config: &tls.Config{ServerName: certDomain}}
+func probeTLS(ctx context.Context, config *tls.Config, dialHostPort string) error {
+	dialer := &tls.Dialer{Config: config}
 	conn, err := dialer.DialContext(ctx, "tcp", dialHostPort)
 	if err != nil {
 		return fmt.Errorf("connecting to %q: %w", dialHostPort, err)
@@ -73,7 +70,7 @@ func probeTLS(ctx context.Context, certDomain string, dialHostPort string) error
 func validateConnState(ctx context.Context, cs *tls.ConnectionState) (returnerr error) {
 	var errs []error
 	defer func() {
-		returnerr = multierr.New(errs...)
+		returnerr = errors.Join(errs...)
 	}()
 	latestAllowedExpiration := time.Now().Add(expiresSoon)
 
@@ -110,6 +107,10 @@ func validateConnState(ctx context.Context, cs *tls.ConnectionState) (returnerr 
 	}
 
 	if len(leafCert.CRLDistributionPoints) == 0 {
+		if !slices.Contains(leafCert.Issuer.Organization, "Let's Encrypt") {
+			// LE certs contain a CRL, but certs from other CAs might not.
+			return
+		}
 		if leafCert.NotBefore.Before(time.Unix(letsEncryptStartedStaplingCRL, 0)) {
 			// Certificate might not have a CRL.
 			return
