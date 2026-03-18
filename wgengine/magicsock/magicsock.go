@@ -4143,12 +4143,6 @@ func (c *Conn) SetLastNetcheckReportForTest(ctx context.Context, report *netchec
 
 // lazyEndpoint is a wireguard [conn.Endpoint] for when magicsock received a
 // non-disco (presumably WireGuard) packet from a UDP address from which we
-<<<<<<< HEAD
-// can't map to a Tailscale peer. But Wireguard most likely can, once it
-// decrypts it. So we implement the conn.PeerAwareEndpoint interface
-// from https://github.com/sagernet/wireguard-go/pull/27 to allow WireGuard
-// to tell us who it is later and get the correct conn.Endpoint.
-=======
 // can't map to a Tailscale peer. But WireGuard most likely can, once it
 // decrypts it. So we implement the [conn.InitiationAwareEndpoint] and
 // [conn.PeerAwareEndpoint] interfaces, to allow WireGuard to tell us who it is
@@ -4162,7 +4156,6 @@ func (c *Conn) SetLastNetcheckReportForTest(ctx context.Context, report *netchec
 // collisions have a higher chance of occurrence for packets received over peer
 // relays versus direct connections, as peer relay connections do not upsert
 // into [peerMap] around disco packet reception, but direct connections do.
->>>>>>> v1.92.4-sing-box-1.13-mod.6
 type lazyEndpoint struct {
 	c       *Conn
 	maybeEP *endpoint // or nil if unknown
@@ -4170,14 +4163,9 @@ type lazyEndpoint struct {
 }
 
 var (
-<<<<<<< HEAD
-	_ conn.PeerAwareEndpoint = (*lazyEndpoint)(nil)
-	_ conn.Endpoint          = (*lazyEndpoint)(nil)
-=======
 	_ conn.InitiationAwareEndpoint = (*lazyEndpoint)(nil)
 	_ conn.PeerAwareEndpoint       = (*lazyEndpoint)(nil)
 	_ conn.Endpoint                = (*lazyEndpoint)(nil)
->>>>>>> v1.92.4-sing-box-1.13-mod.6
 )
 
 // InitiationMessagePublicKey implements [conn.InitiationAwareEndpoint].
