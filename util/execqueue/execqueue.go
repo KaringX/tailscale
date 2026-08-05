@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package execqueue implements an ordered asynchronous queue for executing functions.
@@ -85,6 +85,36 @@ func (q *ExecQueue) Shutdown() {
 	q.closed = true
 	if q.cancel != nil {
 		q.cancel()
+	}
+}
+
+// ShutdownAndWait signals the queue to stop, discards any queued
+// functions that have not started, and waits for the currently
+// executing function, if any, to complete or ctx to expire.
+//
+// It must not be called while holding a lock that a queued function
+// may acquire, or it will not return until ctx expires.
+func (q *ExecQueue) ShutdownAndWait(ctx context.Context) error {
+	q.mu.Lock()
+	q.closed = true
+	if q.cancel != nil {
+		q.cancel()
+	}
+	waitCh := q.doneWaiter
+	if q.inFlight && waitCh == nil {
+		waitCh = make(chan struct{})
+		q.doneWaiter = waitCh
+	}
+	q.mu.Unlock()
+
+	if waitCh == nil {
+		return nil
+	}
+	select {
+	case <-waitCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

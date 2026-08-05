@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package logpolicy manages the creation or reuse of logtail loggers,
@@ -41,6 +41,7 @@ import (
 	"github.com/sagernet/tailscale/net/netknob"
 	"github.com/sagernet/tailscale/net/netmon"
 	"github.com/sagernet/tailscale/net/netns"
+	"github.com/sagernet/tailscale/net/netutil"
 	"github.com/sagernet/tailscale/net/netx"
 	"github.com/sagernet/tailscale/net/tlsdial"
 	"github.com/sagernet/tailscale/paths"
@@ -51,13 +52,15 @@ import (
 	"github.com/sagernet/tailscale/util/eventbus"
 	"github.com/sagernet/tailscale/util/must"
 	"github.com/sagernet/tailscale/util/racebuild"
-	"github.com/sagernet/tailscale/util/syspolicy/pkey"
-	"github.com/sagernet/tailscale/util/syspolicy/policyclient"
 	"github.com/sagernet/tailscale/util/testenv"
 	"github.com/sagernet/tailscale/version"
 	"github.com/sagernet/tailscale/version/distro"
 	"golang.org/x/term"
 )
+
+// GetLogTarget is an optional hook to register a function
+// that returns the log target URL to be used by logpolicy.
+var GetLogTarget feature.Hook[func() string]
 
 var getLogTargetOnce struct {
 	sync.Once
@@ -66,8 +69,12 @@ var getLogTargetOnce struct {
 
 func getLogTarget() string {
 	getLogTargetOnce.Do(func() {
-		envTarget, _ := os.LookupEnv("TS_LOG_TARGET")
-		getLogTargetOnce.v, _ = policyclient.Get().GetString(pkey.LogTarget, envTarget)
+		if f, ok := GetLogTarget.GetOk(); ok {
+			getLogTargetOnce.v = f()
+		}
+		if getLogTargetOnce.v == "" {
+			getLogTargetOnce.v, _ = os.LookupEnv("TS_LOG_TARGET")
+		}
 	})
 
 	return getLogTargetOnce.v
@@ -538,7 +545,18 @@ func (opts Options) init(disableLogging bool) (*logtail.Config, *Policy) {
 		// anyway, no need to add one.
 		lflags = 0
 	}
-	console := log.New(stderrWriter{}, "", lflags)
+	var conWriter io.Writer = stderrWriter{}
+	if buildfeatures.HasSyslog {
+		if f, ok := feature.HookLogSink.GetOk(); ok {
+			if w := f(); w != nil {
+				// Logs are being redirected elsewhere (e.g. to syslog,
+				// which records its own timestamps).
+				conWriter = w
+				lflags = 0
+			}
+		}
+	}
+	console := log.New(conWriter, "", lflags)
 
 	var earlyErrBuf bytes.Buffer
 	earlyLogf := func(format string, a ...any) {
@@ -877,7 +895,7 @@ func (opts TransportOptions) New() http.RoundTripper {
 		opts.NetMon = netmon.NewStatic()
 	}
 	// Start with a copy of http.DefaultTransport and tweak it a bit.
-	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr := netutil.NewDefaultTransport()
 	if opts.TLSClientConfig != nil {
 		tr.TLSClientConfig = opts.TLSClientConfig.Clone()
 	}

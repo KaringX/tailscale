@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package egressservices contains shared types for exposing tailnet services to
@@ -96,6 +96,7 @@ func (p PortMaps) MarshalJSON() ([]byte, error) {
 // services for a proxy identified by the PodIP.
 type Status struct {
 	PodIPv4 string `json:"podIPv4"`
+	PodIPv6 string `json:"podIPv6,omitempty"`
 	// All egress service status keyed by service name.
 	Services map[string]*ServiceStatus `json:"services"`
 }

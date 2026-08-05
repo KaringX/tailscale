@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package version provides the version that the binary was built at.
@@ -146,6 +146,23 @@ var getEmbeddedInfo = sync.OnceValue(func() embeddedInfo {
 	return ret
 })
 
+// tailscaleToolchainRev returns the git hash of the Tailscale Go toolchain
+// used to build this binary, if any. It is read separately from getEmbeddedInfo
+// because that function discards build info when VCS fields are missing (e.g.
+// in test binaries), but the toolchain rev is still present.
+var tailscaleToolchainRev = sync.OnceValue(func() string {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	for _, s := range bi.Settings {
+		if s.Key == "tailscale.toolchain.rev" {
+			return s.Value
+		}
+	}
+	return ""
+})
+
 func gitCommit() string {
 	if gitCommitStamp != "" {
 		return gitCommitStamp
@@ -171,6 +188,10 @@ func majorMinorPatch() string {
 	ret, _, _ := strings.Cut(Short(), "-")
 	return ret
 }
+
+// IsTailscaleGo reports whether the current binary was built with
+// Tailscale's custom Go toolchain.
+func IsTailscaleGo() bool { return isTailscaleGo }
 
 func isValidLongWithTwoRepos(v string) bool {
 	s := strings.Split(v, "-")

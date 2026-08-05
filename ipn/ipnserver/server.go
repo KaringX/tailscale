@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package ipnserver runs the LocalAPI HTTP server that communicates
@@ -430,7 +430,7 @@ func (s *Server) addActiveHTTPRequest(req *http.Request, actor ipnauth.Actor) (o
 	if len(s.activeReqs) == 1 {
 		if envknob.GOOS() == "windows" && !actor.IsLocalSystem() {
 			// Tell the LocalBackend about the identity we're now running as,
-			// unless its the SYSTEM user. That user is not a real account and
+			// unless it's the SYSTEM user. That user is not a real account and
 			// doesn't have a home directory.
 			lb.SetCurrentUser(actor)
 		}

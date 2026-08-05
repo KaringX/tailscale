@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package shared contains types and functions shared by different drive
@@ -42,10 +42,7 @@ func (d *DirFile) Readdir(count int) ([]fs.FileInfo, error) {
 		return result, nil
 	}
 
-	n := len(d.children)
-	if count < n {
-		n = count
-	}
+	n := min(count, len(d.children))
 	result := d.children[:n]
 	d.children = d.children[n:]
 	if len(d.children) == 0 {

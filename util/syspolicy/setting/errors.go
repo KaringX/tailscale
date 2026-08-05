@@ -1,12 +1,10 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package setting
 
 import (
 	"errors"
-
-	"github.com/sagernet/tailscale/types/ptr"
 )
 
 var (
@@ -39,7 +37,7 @@ type ErrorText string
 
 // NewErrorText returns a [ErrorText] with the specified error message.
 func NewErrorText(text string) *ErrorText {
-	return ptr.To(ErrorText(text))
+	return func() *ErrorText { godownValue := ErrorText(text); return &godownValue }()
 }
 
 // MaybeErrorText returns an [ErrorText] with the text of the specified error,
@@ -51,7 +49,7 @@ func MaybeErrorText(err error) *ErrorText {
 	if err, ok := err.(*ErrorText); ok {
 		return err
 	}
-	return ptr.To(ErrorText(err.Error()))
+	return func() *ErrorText { godownValue := ErrorText(err.Error()); return &godownValue }()
 }
 
 // Error implements error.

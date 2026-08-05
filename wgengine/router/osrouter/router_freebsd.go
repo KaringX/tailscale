@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package osrouter
@@ -7,7 +7,6 @@ import (
 	"github.com/sagernet/tailscale/net/netmon"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/wgengine/router"
-	"github.com/sagernet/wireguard-go/tun"
 )
 
 func init() {

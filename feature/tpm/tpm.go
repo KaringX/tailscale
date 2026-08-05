@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package tpm implements support for TPM 2.0 devices.
@@ -243,8 +243,11 @@ func (s *tpmStore) WriteState(k ipn.StateKey, bs []byte) error {
 	if bytes.Equal(s.cache[k], bs) {
 		return nil
 	}
-	s.cache[k] = bytes.Clone(bs)
-
+	if bs == nil {
+		delete(s.cache, k)
+	} else {
+		s.cache[k] = bytes.Clone(bs)
+	}
 	return s.writeSealed()
 }
 

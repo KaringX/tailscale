@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package auditlog provides a mechanism for logging audit events.
@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	godownerrors "github.com/sagernet/tailscale/internal/godown/std/errors"
 	"github.com/sagernet/tailscale/ipn"
 	"github.com/sagernet/tailscale/tailcfg"
 	"github.com/sagernet/tailscale/types/logger"
@@ -69,8 +70,11 @@ type Opts struct {
 // IsRetryableError returns true if the given error is retryable
 // See [controlclient.apiResponseError].  Potentially retryable errors implement the Retryable() method.
 func IsRetryableError(err error) bool {
-	var retryable interface{ Retryable() bool }
-	return errors.As(err, &retryable) && retryable.Retryable()
+	retryable, ok := godownerrors.AsType[interface {
+		error
+		Retryable() bool
+	}](err)
+	return ok && retryable.Retryable()
 }
 
 type backoffOpts struct {

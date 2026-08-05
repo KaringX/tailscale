@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipnlocal
@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -90,6 +89,11 @@ type ExtensionHost struct {
 
 	extByType sync.Map // reflect.Type -> ipnext.Extension
 
+	// hasPendingAuthReconfig tracks whether an AuthReconfig call
+	// has been enqueued but not yet executed. It avoids redundant
+	// reconfigs and prevents them from piling up in the workQueue.
+	hasPendingAuthReconfig atomic.Bool
+
 	// mu protects the following fields.
 	// It must not be held when calling [LocalBackend] methods
 	// or when invoking callbacks registered by extensions.
@@ -123,6 +127,8 @@ type Backend interface {
 	SendNotify(ipn.Notify)
 
 	NodeBackend() ipnext.NodeBackend
+
+	authReconfig()
 
 	ipnext.SafeBackend
 }
@@ -262,7 +268,10 @@ func (h *ExtensionHost) init() {
 	// Report active extensions to the log.
 	// TODO(nickkhyl): update client metrics to include the active/failed/skipped extensions.
 	h.mu.Lock()
-	extensionNames := slices.Collect(maps.Keys(h.extensionsByName))
+	var extensionNames []string
+	for _, ext := range h.activeExtensions {
+		extensionNames = append(extensionNames, ext.Name())
+	}
 	h.mu.Unlock()
 	h.logf("active extensions: %v", strings.Join(extensionNames, ", "))
 
@@ -339,7 +348,7 @@ func (h *ExtensionHost) FindMatchingExtension(target any) bool {
 
 	val := reflect.ValueOf(target)
 	typ := val.Type()
-	if typ.Kind() != reflect.Ptr || val.IsNil() {
+	if typ.Kind() != reflect.Pointer || val.IsNil() {
 		panic("ipnext: target must be a non-nil pointer")
 	}
 	targetType := typ.Elem()
@@ -539,6 +548,22 @@ func (h *ExtensionHost) Shutdown() {
 	// or prevent any further init calls from happening.
 	h.initOnce.Do(func() {})
 	h.shutdownOnce.Do(h.shutdown)
+}
+
+// AuthReconfigAsync implements [ipnext.Host.AuthReconfigAsync].
+// Since execution uses the most recent state at execution time,
+// multiple enqueued calls are redundant and are not enqueued.
+func (h *ExtensionHost) AuthReconfigAsync() {
+	if h == nil {
+		return
+	}
+	if h.hasPendingAuthReconfig.Swap(true) {
+		return
+	}
+	h.enqueueBackendOperation(func(b Backend) {
+		h.hasPendingAuthReconfig.Store(false)
+		b.authReconfig()
+	})
 }
 
 func (h *ExtensionHost) shutdown() {

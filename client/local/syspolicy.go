@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !ts_omit_syspolicy
@@ -13,6 +13,9 @@ import (
 )
 
 // GetEffectivePolicy returns the effective policy for the specified scope.
+//
+// API maturity: this method is not considered a stable API and is
+// subject to change between releases.
 func (lc *Client) GetEffectivePolicy(ctx context.Context, scope setting.PolicyScope) (*setting.Snapshot, error) {
 	scopeID, err := scope.MarshalText()
 	if err != nil {

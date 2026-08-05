@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package STUN generates STUN request packets and parses response packets.
@@ -211,8 +211,8 @@ func ParseResponse(b []byte) (tID TxID, addr netip.AddrPort, err error) {
 	var fallbackAddr netip.AddrPort
 
 	// Read through the attributes.
-	// The the addr+port reported by XOR-MAPPED-ADDRESS
-	// as the canonical value. If the attribute is not
+	// The addr+port reported by XOR-MAPPED-ADDRESS
+	// is the canonical value. If the attribute is not
 	// present but the STUN server responds with
 	// MAPPED-ADDRESS we fall back to it.
 	if err := foreachAttr(b, func(attrType uint16, attr []byte) error {

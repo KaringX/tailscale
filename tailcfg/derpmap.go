@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package tailcfg
@@ -11,6 +11,9 @@ import (
 )
 
 // DERPMap describes the set of DERP packet relay servers that are available.
+//
+// API maturity: this type is subject to minor changes over time, though
+// its general shape is stable.
 type DERPMap struct {
 	// HomeParams, if non-nil, is a change in home parameters.
 	//

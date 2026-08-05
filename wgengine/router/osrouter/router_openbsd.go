@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package osrouter
@@ -12,6 +12,7 @@ import (
 
 	"github.com/sagernet/tailscale/health"
 	"github.com/sagernet/tailscale/net/netmon"
+	"github.com/sagernet/tailscale/net/netns"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/util/eventbus"
 	"github.com/sagernet/tailscale/util/set"
@@ -32,12 +33,13 @@ func init() {
 // https://git.zx2c4.com/wireguard-openbsd.
 
 type openbsdRouter struct {
-	logf    logger.Logf
-	netMon  *netmon.Monitor
-	tunname string
-	local4  netip.Prefix
-	local6  netip.Prefix
-	routes  set.Set[netip.Prefix]
+	logf            logger.Logf
+	netMon          *netmon.Monitor
+	tunname         string
+	local4          netip.Prefix
+	local6          netip.Prefix
+	routes          set.Set[netip.Prefix]
+	areDefaultRoute bool
 }
 
 func newUserspaceRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor, health *health.Tracker, bus *eventbus.Bus) (router.Router, error) {
@@ -74,6 +76,10 @@ func inet(p netip.Prefix) string {
 		return "inet6"
 	}
 	return "inet"
+}
+
+func isDefaultRoute(p netip.Prefix) bool {
+	return p.Bits() == 0
 }
 
 func (r *openbsdRouter) Set(cfg *router.Config) error {
@@ -235,8 +241,12 @@ func (r *openbsdRouter) Set(cfg *router.Config) error {
 			routeadd := []string{
 				"route", "-q", "-n",
 				"add", "-" + inet(route), nstr,
-				"-iface", dst,
 			}
+			if isDefaultRoute(route) {
+				// 1 is reserved for kernel
+				routeadd = append(routeadd, "-priority", "2")
+			}
+			routeadd = append(routeadd, "-iface", dst)
 			out, err := cmd(routeadd...).CombinedOutput()
 			if err != nil {
 				r.logf("addr add failed: %v: %v\n%s", routeadd, err, out)
@@ -251,10 +261,33 @@ func (r *openbsdRouter) Set(cfg *router.Config) error {
 	r.local6 = localAddr6
 	r.routes = newRoutes
 
+	areDefault := false
+	for route := range newRoutes {
+		if isDefaultRoute(route) {
+			areDefault = true
+			break
+		}
+	}
+
+	// Set up or tear down the bypass rtable as needed
+	if areDefault && !r.areDefaultRoute {
+		if _, err := netns.SetupBypassRtable(r.logf); err != nil {
+			r.logf("router: failed to set up bypass rtable: %v", err)
+		}
+		r.areDefaultRoute = true
+	} else if !areDefault && r.areDefaultRoute {
+		netns.CleanupBypassRtable(r.logf)
+		r.areDefaultRoute = false
+	}
+
 	return errq
 }
 
 func (r *openbsdRouter) Close() error {
+	if r.areDefaultRoute {
+		netns.CleanupBypassRtable(r.logf)
+		r.areDefaultRoute = false
+	}
 	cleanUp(r.logf, r.tunname)
 	return nil
 }

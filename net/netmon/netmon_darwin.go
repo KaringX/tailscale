@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package netmon
@@ -15,6 +15,12 @@ import (
 	"golang.org/x/net/route"
 	"golang.org/x/sys/unix"
 )
+
+func init() {
+	IsInterestingInterface = func(iface Interface, prefixes []netip.Prefix) bool {
+		return isInterestingInterface(iface.Name)
+	}
+}
 
 const debugRouteMessages = false
 
@@ -125,11 +131,10 @@ func addrType(addrs []route.Addr, rtaxType int) route.Addr {
 	return nil
 }
 
-func (m *darwinRouteMon) IsInterestingInterface(iface string) bool {
+func isInterestingInterface(iface string) bool {
 	baseName := strings.TrimRight(iface, "0123456789")
 	switch baseName {
-	// TODO(maisem): figure out what this list should actually be.
-	case "llw", "awdl", "ipsec":
+	case "llw", "awdl", "ipsec", "gif", "XHC", "anpi", "lo", "utun":
 		return false
 	}
 	return true
@@ -137,7 +142,7 @@ func (m *darwinRouteMon) IsInterestingInterface(iface string) bool {
 
 func (m *darwinRouteMon) skipInterfaceAddrMessage(msg *route.InterfaceAddrMessage) bool {
 	if la, ok := addrType(msg.Addrs, unix.RTAX_IFP).(*route.LinkAddr); ok {
-		if !m.IsInterestingInterface(la.Name) {
+		if !isInterestingInterface(la.Name) {
 			return true
 		}
 	}
@@ -145,10 +150,29 @@ func (m *darwinRouteMon) skipInterfaceAddrMessage(msg *route.InterfaceAddrMessag
 }
 
 func (m *darwinRouteMon) skipRouteMessage(msg *route.RouteMessage) bool {
+	// RTM_MISS fires on every failed route lookup (no matching entry in the
+	// routing table). It scales with traffic volume, not network-state
+	// changes, and is never the leading signal for a topology change: route
+	// withdrawals emit RTM_DELETE synchronously before any subsequent lookup
+	// can miss. Letting these through causes netmon to report spurious
+	// link changes, which trigger a re-STUN/netcheck loop when a probe
+	// destination is unreachable (e.g. IPv6 DERP probes on a network with
+	// no IPv6 default route), as each failed probe emits another RTM_MISS.
+	if msg.Type == unix.RTM_MISS {
+		return true
+	}
 	if ip := ipOfAddr(addrType(msg.Addrs, unix.RTAX_DST)); ip.IsLinkLocalUnicast() {
 		// Skip those like:
 		// dst = fe80::b476:66ff:fe30:c8f6%15
 		return true
+	}
+
+	// We can skip route messages from uninteresting interfaces.  We do this upstream
+	// against the InterfaceMonitor, but skipping them here avoids unnecessary work.
+	if la, ok := addrType(msg.Addrs, unix.RTAX_IFP).(*route.LinkAddr); ok {
+		if !isInterestingInterface(la.Name) {
+			return true
+		}
 	}
 	return false
 }

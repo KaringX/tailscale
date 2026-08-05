@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !android && !ios
@@ -21,14 +21,18 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/tailscale/feature"
 	"github.com/sagernet/tailscale/health"
+	"github.com/sagernet/tailscale/hostinfo"
 	"github.com/sagernet/tailscale/net/dns/resolvconffile"
 	"github.com/sagernet/tailscale/net/tsaddr"
+	"github.com/sagernet/tailscale/types/lazy"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/util/dnsname"
+	"github.com/sagernet/tailscale/util/eventbus"
 	"github.com/sagernet/tailscale/version/distro"
 )
 
@@ -135,6 +139,11 @@ type directManager struct {
 	// but is better than having non-functioning DNS.
 	renameBroken bool
 
+	trampleCount  atomic.Int64
+	trampleTimer  *time.Timer
+	eventClient   *eventbus.Client
+	trampleDNSPub *eventbus.Publisher[TrampleDNS]
+
 	ctx      context.Context    // valid until Close
 	ctxClose context.CancelFunc // closes ctx
 
@@ -145,11 +154,13 @@ type directManager struct {
 }
 
 //lint:ignore U1000 used in manager_{freebsd,openbsd}.go
-func newDirectManager(logf logger.Logf, health *health.Tracker) *directManager {
-	return newDirectManagerOnFS(logf, health, directFS{})
+func newDirectManager(logf logger.Logf, health *health.Tracker, bus *eventbus.Bus) *directManager {
+	return newDirectManagerOnFS(logf, health, bus, directFS{})
 }
 
-func newDirectManagerOnFS(logf logger.Logf, health *health.Tracker, fs wholeFileFS) *directManager {
+var trampleWatchDuration = 5 * time.Second
+
+func newDirectManagerOnFS(logf logger.Logf, health *health.Tracker, bus *eventbus.Bus, fs wholeFileFS) *directManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &directManager{
 		logf:     logf,
@@ -158,6 +169,13 @@ func newDirectManagerOnFS(logf logger.Logf, health *health.Tracker, fs wholeFile
 		ctx:      ctx,
 		ctxClose: cancel,
 	}
+	if bus != nil {
+		m.eventClient = bus.Client("dns.directManager")
+		m.trampleDNSPub = eventbus.Publish[TrampleDNS](m.eventClient)
+	}
+	m.trampleTimer = time.AfterFunc(trampleWatchDuration, func() {
+		m.trampleCount.Store(0)
+	})
 	go m.runFileWatcher()
 	return m
 }
@@ -261,6 +279,9 @@ func (m *directManager) rename(old, new string) error {
 	if !m.renameBroken {
 		err := m.fs.Rename(old, new)
 		if err == nil {
+			if new == resolvConf {
+				m.relabelResolvConf()
+			}
 			return nil
 		}
 		if runtime.GOOS == "linux" && distro.Get() == distro.Synology {
@@ -293,8 +314,54 @@ func (m *directManager) rename(old, new string) error {
 			return fmt.Errorf("remove of %q failed (%w) and so did truncate: %v", old, err, err2)
 		}
 	}
+	if new == resolvConf {
+		m.relabelResolvConf()
+	}
 	return nil
 }
+
+var restoreconPath lazy.SyncValue[string] // path to restorecon, or "" if absent
+
+// relabelResolvConf restores the policy-default SELinux context on
+// /etc/resolv.conf. Best effort: only runs when SELinux is enforcing. See:
+//
+//	https://github.com/tailscale/tailscale/issues/20149.
+func (m *directManager) relabelResolvConf() {
+	if runtime.GOOS != "linux" {
+		return
+	}
+	restorecon := restoreconPath.Get(func() string {
+		p, _ := exec.LookPath("restorecon")
+		return p
+	})
+	if restorecon == "" {
+		return
+	}
+	if !hostinfo.IsSELinuxEnforcing() {
+		// Clear any prior warning, e.g. if SELinux was turned off at runtime
+		// with setenforce(8) since the last failure.
+		m.health.SetHealthy(selinuxRelabelWarnable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// m.fs may be rooted at a test prefix; restorecon needs the real path.
+	actualPath := m.fs.ActualPath(resolvConf)
+	if out, err := exec.CommandContext(ctx, restorecon, actualPath).CombinedOutput(); err != nil {
+		m.logf("dns: restorecon of %q failed: %v, output: %s", actualPath, err, bytes.TrimSpace(out))
+		m.health.SetUnhealthy(selinuxRelabelWarnable, nil)
+	} else {
+		m.health.SetHealthy(selinuxRelabelWarnable)
+	}
+}
+
+var selinuxRelabelWarnable = health.Register(&health.Warnable{
+	Code:     "resolv-conf-relabel-failed",
+	Severity: health.SeverityMedium,
+	Title:    "DNS configuration issue",
+	Text:     health.StaticMessage("Failed to restore the SELinux label on /etc/resolv.conf; DNS may break when other services manage the file. See https://github.com/tailscale/tailscale/issues/20149"),
+})
 
 // setWant sets the expected contents of /etc/resolv.conf, if any.
 //
@@ -426,7 +493,9 @@ func (m *directManager) runFileWatcher() {
 	if !ok {
 		return
 	}
-	if err := watchFile(m.ctx, "/etc/", resolvConf, m.checkForFileTrample); err != nil {
+	dir := m.fs.ActualPath(filepath.Dir(resolvConf))
+	file := m.fs.ActualPath(resolvConf)
+	if err := watchFile(m.ctx, dir, file, m.checkForFileTrample); err != nil {
 		// This is all best effort for now, so surface warnings to users.
 		m.logf("dns: inotify: %s", err)
 	}
@@ -481,10 +550,26 @@ func (m *directManager) checkForFileTrample() {
 	}
 	m.logf("trample: resolv.conf changed from what we expected. did some other program interfere? current contents: %q", show)
 	m.health.SetUnhealthy(resolvTrampleWarnable, nil)
+	if m.trampleDNSPub != nil {
+		n := m.trampleCount.Add(1)
+
+		if n < 10 {
+			m.trampleDNSPub.Publish(TrampleDNS{
+				LastTrample:       time.Now(),
+				TramplesInTimeout: n,
+			})
+			m.trampleTimer.Reset(trampleWatchDuration)
+		} else {
+			m.logf("trample: resolv.conf overwritten %d times, no longer attempting to replace it.", n)
+		}
+	}
 }
 
 func (m *directManager) Close() error {
 	m.ctxClose()
+	if m.eventClient != nil {
+		m.eventClient.Close()
+	}
 
 	// We used to keep a file for the tailscale config and symlinked
 	// to it, but then we stopped because /etc/resolv.conf being a
@@ -565,6 +650,19 @@ type wholeFileFS interface {
 	ReadFile(name string) ([]byte, error)
 	Remove(name string) error
 	Rename(oldName, newName string) error
+	// ActualPath returns the real filesystem path for the given absolute
+	// logical path. All other methods in this interface accept logical
+	// paths (like "/etc/resolv.conf") and translate them internally;
+	// ActualPath exposes that same translation for callers that need
+	// the real path for use outside the interface (e.g. setting up an
+	// inotify watch on the correct directory).
+	//
+	// For directFS with an empty prefix (production), the input is
+	// returned unchanged ("/etc" → "/etc"). For directFS with a test
+	// prefix like "/tmp/test123", the prefix is joined
+	// ("/etc" → "/tmp/test123/etc"). For wslFS the input is returned
+	// unchanged, since paths are passed through to wsl.exe as-is.
+	ActualPath(name string) string
 	Stat(name string) (isRegular bool, err error)
 	Truncate(name string) error
 	WriteFile(name string, contents []byte, perm os.FileMode) error
@@ -580,6 +678,8 @@ type directFS struct {
 }
 
 func (fs directFS) path(name string) string { return filepath.Join(fs.prefix, name) }
+
+func (fs directFS) ActualPath(name string) string { return fs.path(name) }
 
 func (fs directFS) Stat(name string) (isRegular bool, err error) {
 	fi, err := os.Stat(fs.path(name))

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build ts_omit_tailnetlock
@@ -26,6 +26,15 @@ func (b *LocalBackend) tkaSyncIfNeeded(nm *netmap.NetworkMap, prefs ipn.PrefsVie
 
 func (b *LocalBackend) tkaFilterNetmapLocked(nm *netmap.NetworkMap) {}
 
-func (b *LocalBackend) NetworkLockStatus() *ipnstate.NetworkLockStatus {
-	return &ipnstate.NetworkLockStatus{Enabled: false}
+func (b *LocalBackend) tkaFilterDeltaMutsLocked(muts []netmap.NodeMutation) []netmap.NodeMutation {
+	return muts
+}
+
+func (b *LocalBackend) TailnetLockStatus() *ipnstate.TailnetLockStatus {
+	return &ipnstate.TailnetLockStatus{Enabled: false}
+}
+
+// Deprecated: use [LocalBackend.TailnetLockStatus] instead.
+func (b *LocalBackend) NetworkLockStatus() *ipnstate.TailnetLockStatus {
+	return b.TailnetLockStatus()
 }

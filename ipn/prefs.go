@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipn
@@ -17,10 +17,12 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/sagernet/tailscale/atomicfile"
 	"github.com/sagernet/tailscale/drive"
 	"github.com/sagernet/tailscale/feature/buildfeatures"
+	godownreflect "github.com/sagernet/tailscale/internal/godown/std/reflect"
 	"github.com/sagernet/tailscale/ipn/ipnstate"
 	"github.com/sagernet/tailscale/net/netaddr"
 	"github.com/sagernet/tailscale/net/tsaddr"
@@ -127,7 +129,8 @@ type Prefs struct {
 	ExitNodeAllowLANAccess bool
 
 	// CorpDNS specifies whether to install the Tailscale network's
-	// DNS configuration, if it exists.
+	// DNS configuration, if it exists. It is the internal name for
+	// the "tailscale set --accept-dns=" flag.
 	CorpDNS bool
 
 	// RunSSH bool is whether this node should run an SSH
@@ -274,6 +277,24 @@ type Prefs struct {
 	// Linux-only.
 	NetfilterKind string
 
+	// RemoteConfig, if true, delegates full remote control of this node's
+	// prefs and LocalAPI to the tailnet admin via the control plane. When
+	// enabled, the control server can read and edit any of this node's
+	// prefs at any time, and invoke any LocalAPI endpoint on this node,
+	// without any further local consent (no CLI or GUI confirmation).
+	//
+	// This is an alternative to Tailscale's default per-feature double
+	// opt-in model, in which both the tailnet admin and the local machine
+	// owner must agree to each individual setting change. RemoteConfig is
+	// a single client-side "I trust the tailnet admin" switch that hands
+	// over full remote management of this node.
+	//
+	// Only enable this when the tailnet admin owns the machine (e.g. a
+	// corporate fleet device) or the local user has explicitly delegated
+	// full control to the tailnet admin. Do NOT enable this on personal
+	// or BYOD devices where the tailnet admin is not fully trusted.
+	RemoteConfig bool
+
 	// DriveShares are the configured DriveShares, stored in increasing order
 	// by name.
 	DriveShares []*drive.Share
@@ -288,16 +309,6 @@ type Prefs struct {
 	// candidates for relay connections. Only relevant when RelayServerPort is
 	// non-nil.
 	RelayServerStaticEndpoints []netip.AddrPort `json:",omitempty"`
-
-	// AllowSingleHosts was a legacy field that was always true
-	// for the past 4.5 years. It controlled whether Tailscale
-	// peers got /32 or /128 routes for each other.
-	// As of 2024-05-17 we're starting to ignore it, but to let
-	// people still downgrade Tailscale versions and not break
-	// all peer-to-peer networking we still write it to disk (as JSON)
-	// so it can be loaded back by old versions.
-	// TODO(bradfitz): delete this in 2025 sometime. See #12058.
-	AllowSingleHosts marshalAsTrueInJSON
 
 	// The Persist field is named 'Config' in the file for backward
 	// compatibility with earlier versions.
@@ -328,13 +339,6 @@ func (au1 AutoUpdatePrefs) Equals(au2 AutoUpdatePrefs) bool {
 		apply1 == apply2 &&
 		ok1 == ok2
 }
-
-type marshalAsTrueInJSON struct{}
-
-var trueJSON = []byte("true")
-
-func (marshalAsTrueInJSON) MarshalJSON() ([]byte, error) { return trueJSON, nil }
-func (*marshalAsTrueInJSON) UnmarshalJSON([]byte) error  { return nil }
 
 // AppConnectorPrefs are the app connector settings for the node agent.
 type AppConnectorPrefs struct {
@@ -381,6 +385,7 @@ type MaskedPrefs struct {
 	AppConnectorSet               bool                `json:",omitempty"`
 	PostureCheckingSet            bool                `json:",omitempty"`
 	NetfilterKindSet              bool                `json:",omitempty"`
+	RemoteConfigSet               bool                `json:",omitempty"`
 	DriveSharesSet                bool                `json:",omitempty"`
 	RelayServerPortSet            bool                `json:",omitempty"`
 	RelayServerStaticEndpointsSet bool                `json:",omitzero"`
@@ -437,12 +442,11 @@ func applyPrefsEdits(src, dst reflect.Value, mask map[string]reflect.Value) {
 
 func maskFields(v reflect.Value) map[string]reflect.Value {
 	mask := make(map[string]reflect.Value)
-	for i := range v.NumField() {
-		f := v.Type().Field(i).Name
-		if !strings.HasSuffix(f, "Set") {
+	for sf, fv := range godownreflect.ValueFields(v) {
+		if !strings.HasSuffix(sf.Name, "Set") {
 			continue
 		}
-		mask[strings.TrimSuffix(f, "Set")] = v.Field(i)
+		mask[strings.TrimSuffix(sf.Name, "Set")] = fv
 	}
 	return mask
 }
@@ -568,6 +572,9 @@ func (p *Prefs) pretty(goos string) string {
 	if p.ShieldsUp {
 		sb.WriteString("shields=true ")
 	}
+	if p.RemoteConfig {
+		sb.WriteString("remoteconfig=true ")
+	}
 	if buildfeatures.HasUseExitNode {
 		if p.ExitNodeIP.IsValid() {
 			fmt.Fprintf(&sb, "exit=%v lan=%t ", p.ExitNodeIP, p.ExitNodeAllowLANAccess)
@@ -690,6 +697,7 @@ func (p *Prefs) Equals(p2 *Prefs) bool {
 		p.PostureChecking == p2.PostureChecking &&
 		slices.EqualFunc(p.DriveShares, p2.DriveShares, drive.SharesEqual) &&
 		p.NetfilterKind == p2.NetfilterKind &&
+		p.RemoteConfig == p2.RemoteConfig &&
 		compareUint16Ptrs(p.RelayServerPort, p2.RelayServerPort) &&
 		slices.Equal(p.RelayServerStaticEndpoints, p2.RelayServerStaticEndpoints)
 }
@@ -843,22 +851,15 @@ func (p *Prefs) SetAdvertiseExitNode(runExit bool) {
 // Tailscale IP.
 func peerWithTailscaleIP(st *ipnstate.Status, ip netip.Addr) (ps *ipnstate.PeerStatus, ok bool) {
 	for _, ps := range st.Peer {
-		for _, ip2 := range ps.TailscaleIPs {
-			if ip == ip2 {
-				return ps, true
-			}
+		if slices.Contains(ps.TailscaleIPs, ip) {
+			return ps, true
 		}
 	}
 	return nil, false
 }
 
 func isRemoteIP(st *ipnstate.Status, ip netip.Addr) bool {
-	for _, selfIP := range st.TailscaleIPs {
-		if ip == selfIP {
-			return false
-		}
-	}
-	return true
+	return !slices.Contains(st.TailscaleIPs, ip)
 }
 
 // ClearExitNode sets the ExitNodeID and ExitNodeIP to their zero values.
@@ -878,10 +879,14 @@ func (e ExitNodeLocalIPError) Error() string {
 	return fmt.Sprintf("cannot use %s as an exit node as it is a local IP address to this machine", e.hostOrIP)
 }
 
+// exitNodeIPOfArg returns the IP address of the exit node based on the
+// user-provided string.
 func exitNodeIPOfArg(s string, st *ipnstate.Status) (ip netip.Addr, err error) {
 	if s == "" {
 		return ip, os.ErrInvalid
 	}
+
+	// If the string is a valid IP address, that's the exit node.
 	ip, err = netip.ParseAddr(s)
 	if err == nil {
 		if !isRemoteIP(st, ip) {
@@ -900,13 +905,29 @@ func exitNodeIPOfArg(s string, st *ipnstate.Status) (ip netip.Addr, err error) {
 		}
 		return ip, nil
 	}
+
+	// If the string is not a valid IP address, assume it's a hostname.
+	// Search the list of peers for a matching hostname.
+	if len(st.Peer) == 0 {
+		return ip, errors.New("cannot resolve exit node by hostname while Tailscale is starting up; " +
+			"please use its Tailscale IP address instead")
+	}
 	match := 0
 	for _, ps := range st.Peer {
-		baseName := dnsname.TrimSuffix(ps.DNSName, st.MagicDNSSuffix)
-		if !strings.EqualFold(s, baseName) && !strings.EqualFold(s, ps.DNSName) {
+		// Compare to the peer name in three forms:
+		//
+		//	- base name ("example")
+		//	- FQDN ("example.tail1234.ts.net.")
+		// 	- FQDN sans dot ("example.tail1234.ts.net", as returned by `tailscale exit-node list`
+		//	  and the admin console)
+		//
+		fqdn := ps.DNSName
+		baseName := dnsname.TrimSuffix(fqdn, st.MagicDNSSuffix)
+		fqdnSansDot := dnsname.TrimSuffix(fqdn, ".")
+		if !strings.EqualFold(s, baseName) && !strings.EqualFold(s, fqdn) && !strings.EqualFold(s, fqdnSansDot) {
 			// For shared-in nodes whose tailnet suffix differs from ours,
 			// TrimSuffix returns the full FQDN. Try matching the first label (hostname).
-			if hostname, _, ok := strings.Cut(ps.DNSName, "."); !ok || !strings.EqualFold(s, hostname) {
+			if hostname, _, ok := strings.Cut(fqdn, "."); !ok || !strings.EqualFold(s, hostname) {
 				continue
 			}
 		}
@@ -921,7 +942,7 @@ func exitNodeIPOfArg(s string, st *ipnstate.Status) (ip netip.Addr, err error) {
 	}
 	switch match {
 	case 0:
-		return ip, fmt.Errorf("invalid value %q for --exit-node; must be IP or unique node name", s)
+		return ip, fmt.Errorf("invalid value %q for --exit-node; must be IP or peer hostname", s)
 	case 1:
 		if !isRemoteIP(st, ip) {
 			return ip, ExitNodeLocalIPError{s}
@@ -1098,6 +1119,12 @@ type LoginProfile struct {
 	// ControlURL is the URL of the control server that this profile is logged
 	// into.
 	ControlURL string
+
+	// Created is when this profile was first added to this client. It is
+	// stamped once at profile creation and never changes. It is used to sort
+	// the profile list with newest first; profiles created before this field
+	// existed have a zero value and sort after all stamped profiles.
+	Created time.Time `json:",omitzero"`
 }
 
 // Equals reports whether p and p2 are equal.

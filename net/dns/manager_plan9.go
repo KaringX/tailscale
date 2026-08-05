@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // TODO: man 6 ndb | grep -e 'suffix.*same line'
@@ -20,11 +20,12 @@ import (
 	"github.com/sagernet/tailscale/control/controlknobs"
 	"github.com/sagernet/tailscale/health"
 	"github.com/sagernet/tailscale/types/logger"
+	"github.com/sagernet/tailscale/util/eventbus"
 	"github.com/sagernet/tailscale/util/set"
 	"github.com/sagernet/tailscale/util/syspolicy/policyclient"
 )
 
-func NewOSConfigurator(logf logger.Logf, ht *health.Tracker, _ policyclient.Client, knobs *controlknobs.Knobs, interfaceName string) (OSConfigurator, error) {
+func NewOSConfigurator(logf logger.Logf, ht *health.Tracker, _ *eventbus.Bus, _ policyclient.Client, knobs *controlknobs.Knobs, interfaceName string) (OSConfigurator, error) {
 	return &plan9DNSManager{
 		logf:  logf,
 		ht:    ht,

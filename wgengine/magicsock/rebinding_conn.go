@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package magicsock
@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	"github.com/sagernet/tailscale/control/controlknobs"
 	"github.com/sagernet/tailscale/net/batching"
 	"github.com/sagernet/tailscale/net/netaddr"
 	"github.com/sagernet/tailscale/net/packet"
@@ -41,9 +42,9 @@ type RebindingUDPConn struct {
 // nettype.PacketConn to a batchingConn when appropriate. This upgrade is
 // intentionally pushed closest to where read/write ops occur in order to avoid
 // disrupting surrounding code that assumes nettype.PacketConn is a
-// *net.UDPConn.
-func (c *RebindingUDPConn) setConnLocked(p nettype.PacketConn, network string, batchSize int) {
-	upc := batching.TryUpgradeToConn(p, network, batchSize)
+// *net.UDPConn. knobs may be nil.
+func (c *RebindingUDPConn) setConnLocked(p nettype.PacketConn, network string, batchSize int, knobs *controlknobs.Knobs) {
+	upc := batching.TryUpgradeToConn(p, network, batchSize, "magicsock_udp_rxq_overflows", knobs)
 	c.pconn = upc
 	c.pconnAtomic.Store(&upc)
 	c.port = uint16(c.localAddrLocked().Port)

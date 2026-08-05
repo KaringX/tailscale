@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build (linux && !android) || freebsd || openbsd
@@ -82,7 +82,7 @@ func (m openresolvManager) GetBaseConfig() (OSConfig, error) {
 
 	// Remove the "tailscale" snippet from the list.
 	args := []string{"-l"}
-	for _, f := range strings.Split(strings.TrimSpace(string(bs)), " ") {
+	for f := range strings.SplitSeq(strings.TrimSpace(string(bs)), " ") {
 		if f == "tailscale" {
 			continue
 		}

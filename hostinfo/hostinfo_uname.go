@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux || freebsd || openbsd || darwin
@@ -8,7 +8,6 @@ package hostinfo
 import (
 	"runtime"
 
-	"github.com/sagernet/tailscale/types/ptr"
 	"golang.org/x/sys/unix"
 )
 
@@ -16,7 +15,7 @@ func init() {
 	unameMachine = lazyUnameMachine.Get
 }
 
-var lazyUnameMachine = &lazyAtomicValue[string]{f: ptr.To(unameMachineUnix)}
+var lazyUnameMachine = &lazyAtomicValue[string]{f: func() *func() string { godownValue := unameMachineUnix; return &godownValue }()}
 
 func unameMachineUnix() string {
 	switch runtime.GOOS {

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package debugportmapper registers support for debugging Tailscale's
@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +19,7 @@ import (
 	"github.com/sagernet/tailscale/net/netmon"
 	"github.com/sagernet/tailscale/net/portmapper"
 	"github.com/sagernet/tailscale/types/logger"
+	"github.com/sagernet/tailscale/util/def"
 	"github.com/sagernet/tailscale/util/eventbus"
 )
 
@@ -66,7 +66,7 @@ func serveDebugPortmap(h *localapi.Handler, w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	if defBool(r.FormValue("log_http"), false) {
+	if def.Bool(r.FormValue("log_http"), false) {
 		debugKnobs.LogHTTP = true
 	}
 
@@ -132,7 +132,7 @@ func serveDebugPortmap(h *localapi.Handler, w http.ResponseWriter, r *http.Reque
 
 	bus := eventbus.New()
 	defer bus.Close()
-	netMon, err := netmon.New(bus, logger.WithPrefix(logf, "monitor: "))
+	netMon, err := netmon.New(bus, logger.WithPrefix(logf, "monitor: "), nil)
 	if err != nil {
 		logf("error creating monitor: %v", err)
 		return
@@ -190,15 +190,4 @@ func serveDebugPortmap(h *localapi.Handler, w http.ResponseWriter, r *http.Reque
 			h.Logf("serveDebugPortmap: context done: %v", ctx.Err())
 		}
 	}
-}
-
-func defBool(a string, def bool) bool {
-	if a == "" {
-		return def
-	}
-	v, err := strconv.ParseBool(a)
-	if err != nil {
-		return def
-	}
-	return v
 }

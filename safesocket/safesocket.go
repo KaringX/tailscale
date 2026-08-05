@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package safesocket creates either a Unix socket, if possible, or
@@ -120,7 +120,7 @@ func PlatformUsesPeerCreds() bool {
 // runtime.GOOS value instead of using the current one.
 func GOOSUsesPeerCreds(goos string) bool {
 	switch goos {
-	case "linux", "darwin", "freebsd":
+	case "linux", "darwin", "freebsd", "solaris", "illumos":
 		return true
 	}
 	return false

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package localapi contains the HTTP server handlers for tailscaled's API server.
@@ -7,6 +7,7 @@ package localapi
 import (
 	"bytes"
 	"cmp"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -28,13 +29,14 @@ import (
 	"github.com/sagernet/tailscale/envknob"
 	"github.com/sagernet/tailscale/feature"
 	"github.com/sagernet/tailscale/feature/buildfeatures"
-	"github.com/sagernet/tailscale/health/healthmsg"
 	"github.com/sagernet/tailscale/hostinfo"
 	"github.com/sagernet/tailscale/ipn"
+	ipn2 "github.com/sagernet/tailscale/ipn"
 	"github.com/sagernet/tailscale/ipn/ipnauth"
 	"github.com/sagernet/tailscale/ipn/ipnlocal"
 	"github.com/sagernet/tailscale/ipn/ipnstate"
 	"github.com/sagernet/tailscale/logtail"
+	"github.com/sagernet/tailscale/net/neterror"
 	"github.com/sagernet/tailscale/net/netns"
 	"github.com/sagernet/tailscale/net/netutil"
 	"github.com/sagernet/tailscale/tailcfg"
@@ -43,8 +45,8 @@ import (
 	"github.com/sagernet/tailscale/types/key"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/types/logid"
-	"github.com/sagernet/tailscale/types/ptr"
 	"github.com/sagernet/tailscale/util/clientmetric"
+	"github.com/sagernet/tailscale/util/def"
 	"github.com/sagernet/tailscale/util/eventbus"
 	"github.com/sagernet/tailscale/util/httpm"
 	"github.com/sagernet/tailscale/util/mak"
@@ -74,20 +76,25 @@ var handler = map[string]LocalAPIHandler{
 
 	// The other /localapi/v0/NAME handlers are exact matches and contain only NAME
 	// without a trailing slash:
+	"cert-domains":         (*Handler).serveCertDomains,
 	"check-prefs":          (*Handler).serveCheckPrefs,
 	"check-so-mark-in-use": (*Handler).serveCheckSOMarkInUse,
 	"derpmap":              (*Handler).serveDERPMap,
+	"dns-config":           (*Handler).serveDNSConfig,
 	"goroutines":           (*Handler).serveGoroutines,
 	"login-interactive":    (*Handler).serveLoginInteractive,
 	"logout":               (*Handler).serveLogout,
+	"peer-by-id":           (*Handler).servePeerByID,
 	"ping":                 (*Handler).servePing,
 	"prefs":                (*Handler).servePrefs,
 	"reload-config":        (*Handler).reloadConfig,
 	"reset-auth":           (*Handler).serveResetAuth,
+	"services":             (*Handler).serveServices,
 	"set-expiry-sooner":    (*Handler).serveSetExpirySooner,
 	"shutdown":             (*Handler).serveShutdown,
 	"start":                (*Handler).serveStart,
 	"status":               (*Handler).serveStatus,
+	"user-profile":         (*Handler).serveUserProfile,
 	"whois":                (*Handler).serveWhoIs,
 }
 
@@ -99,9 +106,6 @@ func init() {
 		Register("check-ip-forwarding", (*Handler).serveCheckIPForwarding)
 		Register("check-udp-gro-forwarding", (*Handler).serveCheckUDPGROForwarding)
 		Register("set-udp-gro-forwarding", (*Handler).serveSetUDPGROForwarding)
-	}
-	if buildfeatures.HasUseExitNode && runtime.GOOS == "linux" {
-		Register("check-reverse-path-filtering", (*Handler).serveCheckReversePathFiltering)
 	}
 	if buildfeatures.HasClientMetrics {
 		Register("upload-client-metrics", (*Handler).serveUploadClientMetrics)
@@ -120,7 +124,7 @@ func init() {
 		Register("bugreport", (*Handler).serveBugReport)
 		Register("pprof", (*Handler).servePprof)
 	}
-	if buildfeatures.HasDebug || buildfeatures.HasServe {
+	if buildfeatures.HasIPNBus {
 		Register("watch-ipn-bus", (*Handler).serveWatchIPNBus)
 	}
 	if buildfeatures.HasDNS {
@@ -271,6 +275,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	defer h.b.CheckDeadlocks()()
 	if fn, route, ok := handlerForPath(r.URL.Path); ok {
 		h.logRequest(r.Method, route)
 		fn(h, w, r)
@@ -355,7 +360,7 @@ func (h *Handler) serveIDToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "id-token access denied", http.StatusForbidden)
 		return
 	}
-	nm := h.b.NetMap()
+	nm := h.b.NetMapNoPeers()
 	if nm == nil {
 		http.Error(w, "no netmap", http.StatusServiceUnavailable)
 		return
@@ -405,7 +410,7 @@ func (h *Handler) serveBugReport(w http.ResponseWriter, r *http.Request) {
 	defer h.b.TryFlushLogs() // kick off upload after bugreport's done logging
 
 	logMarker := func() string {
-		return fmt.Sprintf("BUG-%v-%v-%v", h.backendLogID, h.clock.Now().UTC().Format("20060102150405Z"), rands.HexString(16))
+		return fmt.Sprintf("BUG-%v-%v-%v", h.backendLogID, h.clock.Now().UTC().Format(tstime.NumericDateTimeZ), rands.HexString(16))
 	}
 	if envknob.NoLogsNoSupport() {
 		logMarker = func() string { return "BUG-NO-LOGS-NO-SUPPORT-this-node-has-had-its-logging-disabled" }
@@ -425,7 +430,7 @@ func (h *Handler) serveBugReport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Information about the current node from the netmap
-	if nm := h.b.NetMap(); nm != nil {
+	if nm := h.b.NetMapNoPeers(); nm != nil {
 		if self := nm.SelfNode; self.Valid() {
 			h.logf("user bugreport node info: nodeid=%q stableid=%q expiry=%q", self.ID(), self.StableID(), self.KeyExpiry().Format(time.RFC3339))
 		}
@@ -443,7 +448,7 @@ func (h *Handler) serveBugReport(w http.ResponseWriter, r *http.Request) {
 	h.logf.JSON(1, "UserBugReportOS", osdiag.SupportInfo(osdiag.LogSupportInfoReasonBugReport))
 
 	// Tailnet Lock details
-	st := h.b.NetworkLockStatus()
+	st := h.b.TailnetLockStatus()
 	if st.Enabled {
 		h.logf.JSON(1, "UserBugReportTailnetLockStatus", st)
 		if st.NodeKeySignature != nil {
@@ -451,7 +456,7 @@ func (h *Handler) serveBugReport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if defBool(r.URL.Query().Get("diagnose"), false) {
+	if def.Bool(r.URL.Query().Get("diagnose"), false) {
 		if f, ok := ipnlocal.HookDoctor.GetOk(); ok {
 			f(r.Context(), h.b, logger.WithPrefix(h.logf, "diag: "))
 		}
@@ -461,7 +466,7 @@ func (h *Handler) serveBugReport(w http.ResponseWriter, r *http.Request) {
 
 	// Nothing else to do if we're not in record mode; we wrote the marker
 	// above, so we can just finish our response now.
-	if !defBool(r.URL.Query().Get("record"), false) {
+	if !def.Bool(r.URL.Query().Get("record"), false) {
 		return
 	}
 
@@ -550,6 +555,8 @@ type localBackendWhoIsMethods interface {
 	WhoIs(string, netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool)
 	WhoIsNodeKey(key.NodePublic) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool)
 	PeerCaps(netip.Addr) tailcfg.PeerCapMap
+	PeerCapsForIP(src, dst netip.Addr) tailcfg.PeerCapMap
+	PeerCapsForService(src netip.Addr, svcName tailcfg.ServiceName) tailcfg.PeerCapMap
 }
 
 func (h *Handler) serveWhoIsWithBackend(w http.ResponseWriter, r *http.Request, b localBackendWhoIsMethods) {
@@ -597,7 +604,25 @@ func (h *Handler) serveWhoIsWithBackend(w http.ResponseWriter, r *http.Request, 
 		UserProfile: &u,           // always non-nil per WhoIsResponse contract
 	}
 	if n.Addresses().Len() > 0 {
-		res.CapMap = b.PeerCaps(n.Addresses().At(0).Addr())
+		src := n.Addresses().At(0).Addr()
+		switch {
+		case r.FormValue("svc_name") != "":
+			svcName := tailcfg.AsServiceName(r.FormValue("svc_name"))
+			if svcName == "" {
+				http.Error(w, "invalid svc_name", http.StatusBadRequest)
+				return
+			}
+			res.CapMap = b.PeerCapsForService(src, svcName)
+		case r.FormValue("dst_ip") != "":
+			svcAddr, err := netip.ParseAddr(r.FormValue("dst_ip"))
+			if err != nil {
+				http.Error(w, "invalid dst_ip", http.StatusBadRequest)
+				return
+			}
+			res.CapMap = b.PeerCapsForIP(src, svcAddr)
+		default:
+			res.CapMap = b.PeerCaps(src)
+		}
 	}
 	j, err := json.MarshalIndent(res, "", "\t")
 	if err != nil {
@@ -784,32 +809,6 @@ func (h *Handler) serveCheckSOMarkInUse(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-func (h *Handler) serveCheckReversePathFiltering(w http.ResponseWriter, r *http.Request) {
-	if !h.PermitRead {
-		http.Error(w, "reverse path filtering check access denied", http.StatusForbidden)
-		return
-	}
-	var warning string
-
-	state := h.b.Sys().NetMon.Get().InterfaceState()
-	warn, err := netutil.CheckReversePathFiltering(state)
-	if err == nil && len(warn) > 0 {
-		var msg strings.Builder
-		msg.WriteString(healthmsg.WarnExitNodeUsage + ":\n")
-		for _, w := range warn {
-			msg.WriteString("- " + w + "\n")
-		}
-		msg.WriteString(healthmsg.DisableRPFilter)
-		warning = msg.String()
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(struct {
-		Warning string
-	}{
-		Warning: warning,
-	})
-}
-
 func (h *Handler) serveCheckUDPGROForwarding(w http.ResponseWriter, r *http.Request) {
 	if !h.PermitRead {
 		http.Error(w, "UDP GRO forwarding check access denied", http.StatusForbidden)
@@ -855,7 +854,7 @@ func (h *Handler) serveStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	var st *ipnstate.Status
-	if defBool(r.FormValue("peers"), true) {
+	if def.Bool(r.FormValue("peers"), true) {
 		st = h.b.Status()
 	} else {
 		st = h.b.StatusWithoutPeers()
@@ -879,8 +878,8 @@ func InUseOtherUserIPNStream(w http.ResponseWriter, r *http.Request, err error) 
 	}
 	js, err := json.Marshal(&ipn.Notify{
 		Version:    version.Long(),
-		State:      ptr.To(ipn.InUseOtherUser),
-		ErrMessage: ptr.To(err.Error()),
+		State:      func() *ipn2.State { godownValue := ipn.InUseOtherUser; return &godownValue }(),
+		ErrMessage: func() *string { godownValue := err.Error(); return &godownValue }(),
 	})
 	if err != nil {
 		return false
@@ -904,13 +903,25 @@ func (h *Handler) serveWatchIPNBus(w http.ResponseWriter, r *http.Request) {
 
 	var mask ipn.NotifyWatchOpt
 	if s := r.FormValue("mask"); s != "" {
-		v, err := strconv.ParseUint(s, 10, 64)
-		if err != nil {
+		if err := mask.UnmarshalText([]byte(s)); err != nil {
 			http.Error(w, "bad mask", http.StatusBadRequest)
 			return
 		}
-		mask = ipn.NotifyWatchOpt(v)
 	}
+	if mask&ipn.NotifyInProcessNoDisconnect != 0 {
+		http.Error(w, "NotifyInProcessNoDisconnect is only valid for in-process IPN bus subscribers", http.StatusBadRequest)
+		return
+	}
+	if err := ipn.ValidateNotifyWatchOpt(mask); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// NotifyInitialNetMap is permitted alongside NotifyPeerChanges /
+	// NotifyPeerPatches for backwards compatibility with clients that
+	// set both (e.g. the Apple client). On platforms where
+	// goosGetsLegacyNetmapNotify is true, the initial netmap is
+	// delivered regardless; peer-change subscribers simply receive
+	// deltas after that point.
 
 	w.Header().Set("Content-Type", "application/json")
 	ctx := r.Context()
@@ -918,7 +929,9 @@ func (h *Handler) serveWatchIPNBus(w http.ResponseWriter, r *http.Request) {
 	h.b.WatchNotificationsAs(ctx, h.Actor, mask, f.Flush, func(roNotify *ipn.Notify) (keepGoing bool) {
 		err := enc.Encode(roNotify)
 		if err != nil {
-			h.logf("json.Encode: %v", err)
+			if !neterror.IsClosedPipeError(err) {
+				h.logf("json.Encode: %v", err)
+			}
 			return false
 		}
 		f.Flush()
@@ -1105,6 +1118,121 @@ func (h *Handler) serveDERPMap(w http.ResponseWriter, r *http.Request) {
 	e.Encode(h.b.DERPMap())
 }
 
+// serveCertDomains returns the list of DNS.CertDomains from the current
+// netmap, or an empty list if no netmap has been received yet.
+// The returned list is sorted in ascending order.
+func (h *Handler) serveCertDomains(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitRead {
+		http.Error(w, "cert-domains access denied", http.StatusForbidden)
+		return
+	}
+	var domains []string
+	if nm := h.b.NetMapNoPeers(); nm != nil {
+		domains = slices.Clone(nm.DNS.CertDomains)
+		slices.Sort(domains)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(domains)
+}
+
+// serveDNSConfig returns the [tailcfg.DNSConfig] from the current netmap.
+// It returns 503 if no netmap has been received yet.
+func (h *Handler) serveDNSConfig(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitRead {
+		http.Error(w, "dns-config access denied", http.StatusForbidden)
+		return
+	}
+	nm := h.b.NetMapNoPeers()
+	if nm == nil {
+		http.Error(w, "no netmap", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	e := json.NewEncoder(w)
+	e.SetIndent("", "\t")
+	e.Encode(nm.DNS)
+}
+
+// peerByIDBackend is the subset of [ipnlocal.LocalBackend] used by
+// [Handler.servePeerByID]. It exists so the handler can be tested with a
+// trivial mock without spinning up a full LocalBackend.
+type peerByIDBackend interface {
+	PeerByID(tailcfg.NodeID) (tailcfg.NodeView, bool)
+}
+
+// servePeerByID returns the current full [tailcfg.Node] for the peer with the
+// NodeID given in the "id" query parameter. It returns 404 if no such peer is
+// in the current netmap.
+//
+// It is intended for clients that observed a peer-mutation signal (e.g.
+// [ipn.Notify.PeerChangedPatch] or [ipn.Notify.PeersChanged]) and want the
+// latest state of the affected node without having to apply the patch
+// themselves.
+func (h *Handler) servePeerByID(w http.ResponseWriter, r *http.Request) {
+	h.servePeerByIDWithBackend(w, r, h.b)
+}
+
+func (h *Handler) servePeerByIDWithBackend(w http.ResponseWriter, r *http.Request, b peerByIDBackend) {
+	if !h.PermitRead {
+		http.Error(w, "peer-by-id access denied", http.StatusForbidden)
+		return
+	}
+	idStr := r.FormValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		http.Error(w, "invalid 'id' parameter", http.StatusBadRequest)
+		return
+	}
+	nv, ok := b.PeerByID(tailcfg.NodeID(id))
+	if !ok {
+		http.Error(w, "no peer with that NodeID", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	e := json.NewEncoder(w)
+	e.SetIndent("", "\t")
+	e.Encode(nv.AsStruct())
+}
+
+// userProfileBackend is the subset of [ipnlocal.LocalBackend] used by
+// [Handler.serveUserProfile]. It exists so the handler can be tested
+// with a trivial mock without spinning up a full LocalBackend.
+type userProfileBackend interface {
+	UserProfile(tailcfg.UserID) (tailcfg.UserProfileView, bool)
+}
+
+// serveUserProfile returns the current [tailcfg.UserProfile] for the User
+// with the UserID given in the "id" query parameter, in O(1) time. It
+// returns 404 if no such user is in the current netmap.
+//
+// It is the LocalAPI fallback for IPN-bus consumers that see a UserID
+// referenced by a peer Node and want to resolve it to a UserProfile.
+func (h *Handler) serveUserProfile(w http.ResponseWriter, r *http.Request) {
+	h.serveUserProfileWithBackend(w, r, h.b)
+}
+
+func (h *Handler) serveUserProfileWithBackend(w http.ResponseWriter, r *http.Request, b userProfileBackend) {
+	if !h.PermitRead {
+		http.Error(w, "user-profile access denied", http.StatusForbidden)
+		return
+	}
+	idStr := r.FormValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil || id <= 0 {
+		http.Error(w, "invalid 'id' parameter", http.StatusBadRequest)
+		return
+	}
+	uv, ok := b.UserProfile(tailcfg.UserID(id))
+	if !ok {
+		http.Error(w, "no user with that UserID", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	e := json.NewEncoder(w)
+	e.SetIndent("", "\t")
+	e.Encode(uv.AsStruct())
+}
+
 // serveSetExpirySooner sets the expiry date on the current machine, specified
 // by an `expiry` unix timestamp as POST or query param.
 func (h *Handler) serveSetExpirySooner(w http.ResponseWriter, r *http.Request) {
@@ -1201,15 +1329,33 @@ func (h *Handler) serveDial(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing Dial-Host or Dial-Port header", http.StatusBadRequest)
 		return
 	}
+	network := cmp.Or(r.Header.Get("Dial-Network"), "tcp")
+
+	addr := net.JoinHostPort(hostStr, portStr)
+
+	// Check whether the resolved address is a Tailscale route.
+	// If not, tell the client to dial it directly so the connection
+	// comes from the calling user's UID rather than our root-owned daemon.
+	ipp, viaTailscale, err := h.b.Dialer().UserDialPlan(r.Context(), network, addr)
+	if err != nil {
+		http.Error(w, "resolve failure: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	if !viaTailscale {
+		w.Header().Set("Dial-Self", "true")
+		w.Header().Set("Dial-Addr", ipp.String())
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "make request over HTTP/1", http.StatusBadRequest)
 		return
 	}
 
-	network := cmp.Or(r.Header.Get("Dial-Network"), "tcp")
-
-	addr := net.JoinHostPort(hostStr, portStr)
+	// Dial via Tailscale with the original hostname so UserDial can
+	// resolve all addresses and race across families (happy eyeballs).
 	outConn, err := h.b.Dialer().UserDial(r.Context(), network, addr)
 	if err != nil {
 		http.Error(w, "dial failure: "+err.Error(), http.StatusBadGateway)
@@ -1288,13 +1434,8 @@ func (h *Handler) serveUploadClientMetrics(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
 		return
 	}
-	type clientMetricJSON struct {
-		Name  string `json:"name"`
-		Type  string `json:"type"`  // one of "counter" or "gauge"
-		Value int    `json:"value"` // amount to increment metric by
-	}
 
-	var clientMetrics []clientMetricJSON
+	var clientMetrics []clientmetric.MetricUpdate
 	if err := json.NewDecoder(r.Body).Decode(&clientMetrics); err != nil {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
@@ -1304,14 +1445,12 @@ func (h *Handler) serveUploadClientMetrics(w http.ResponseWriter, r *http.Reques
 	defer metricsMu.Unlock()
 
 	for _, m := range clientMetrics {
-		if metric, ok := metrics[m.Name]; ok {
-			metric.Add(int64(m.Value))
-		} else {
+		metric, ok := metrics[m.Name]
+		if !ok {
 			if clientmetric.HasPublished(m.Name) {
 				http.Error(w, "Already have a metric named "+m.Name, http.StatusBadRequest)
 				return
 			}
-			var metric *clientmetric.Metric
 			switch m.Type {
 			case "counter":
 				metric = clientmetric.NewCounter(m.Name)
@@ -1322,7 +1461,15 @@ func (h *Handler) serveUploadClientMetrics(w http.ResponseWriter, r *http.Reques
 				return
 			}
 			metrics[m.Name] = metric
+		}
+		switch m.Op {
+		case "add", "":
 			metric.Add(int64(m.Value))
+		case "set":
+			metric.Set(int64(m.Value))
+		default:
+			http.Error(w, "Unknown metric op "+m.Op, http.StatusBadRequest)
+			return
 		}
 	}
 
@@ -1489,7 +1636,7 @@ func (h *Handler) serveQueryFeature(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing feature", http.StatusInternalServerError)
 		return
 	}
-	nm := h.b.NetMap()
+	nm := h.b.NetMapNoPeers()
 	if nm == nil {
 		http.Error(w, "no netmap", http.StatusServiceUnavailable)
 		return
@@ -1523,17 +1670,6 @@ func (h *Handler) serveQueryFeature(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-}
-
-func defBool(a string, def bool) bool {
-	if a == "" {
-		return def
-	}
-	v, err := strconv.ParseBool(a)
-	if err != nil {
-		return def
-	}
-	return v
 }
 
 // serveUpdateCheck returns the ClientVersion from Status, which contains
@@ -1685,16 +1821,68 @@ func dnsMessageTypeForString(s string) (t dnsmessage.Type, err error) {
 	return 0, errors.New("unknown DNS message type: " + s)
 }
 
+// HookRouteCheckRefresh is the hook to request a refresh of the routecheck Report
+// for this LocalBackend.
+// It is used by serveSuggestExitNode to probe for reachable exit nodes
+// before it makes a suggestion.
+var HookRouteCheckRefresh feature.Hook[func(*ipnlocal.LocalBackend, context.Context, time.Duration) error]
+
 // serveSuggestExitNode serves a POST endpoint for returning a suggested exit node.
+// If the probe query parameter is true,
+// then a new routecheck report will be probed
+// so that the suggested exit node isn’t based on stale reachability data.
+// Combined with probe=true:
+// if the timeout query parameter is 0, any probes will immediately timeout;
+// if the timeout is positive, probes will take that duration before timing out;
+// if the timeout is negative, probes will use the default routecheck timeout.
 func (h *Handler) serveSuggestExitNode(w http.ResponseWriter, r *http.Request) {
 	if !buildfeatures.HasUseExitNode {
 		http.Error(w, feature.ErrUnavailable.Error(), http.StatusNotImplemented)
 		return
 	}
-	if r.Method != httpm.GET {
-		http.Error(w, "only GET allowed", http.StatusMethodNotAllowed)
+
+	switch r.Method {
+	case httpm.GET:
+		// The GET method is inappropriate because it isn’t cacheable.
+		// However, we retain it for backwards compatibility.
+		//
+		// The original implementation used to only allow GET requests,
+		// but since this endpoint powers the `tailscale exit-node suggest` command
+		// whose results can change based on the shape of the network,
+		// it was never a proper GET method in the first place.
+		//
+		// Now that the suggestions are backed by routecheck
+		// and we provide the user the ability to trigger a probe,
+		// this is obviously a POST method because it has side-effects.
+		// However, we don’t want to break existing clients,
+		// so we silently support the old GET method
+		// without the extra query parameters.
+		//
+		// This is also why the default case returns a "want POST" error
+		// and not an "only POST allowed" like the other endpoints.
+		// We still accept GET requests but we don’t want them.
+	case httpm.POST:
+		if !def.Bool(r.FormValue("probe"), false) {
+			break
+		}
+		timeout := def.Duration(r.FormValue("timeout"), -1)
+
+		// Force routecheck to probe for a new report
+		// and use it to suggest an exit node.
+		routecheckRefresh := HookRouteCheckRefresh.GetOrNil()
+		if routecheckRefresh == nil {
+			break
+		}
+		if err := routecheckRefresh(h.b, r.Context(), timeout); err != nil {
+			WriteErrorJSON(w, err)
+			return
+		}
+	default:
+		// Discourage the GET method:
+		http.Error(w, "want POST", http.StatusMethodNotAllowed)
 		return
 	}
+
 	res, err := h.b.SuggestExitNode()
 	if err != nil {
 		WriteErrorJSON(w, err)
@@ -1737,6 +1925,20 @@ func (h *Handler) serveShutdown(w http.ResponseWriter, r *http.Request) {
 	}
 
 	eventbus.Publish[Shutdown](ec).Publish(Shutdown{})
+}
+
+func (h *Handler) serveServices(w http.ResponseWriter, r *http.Request) {
+	if r.Method != httpm.GET {
+		http.Error(w, "only GET allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	nm := h.b.NetMapNoPeers()
+	if nm == nil {
+		http.Error(w, "no netmap", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(nm.Services())
 }
 
 func (h *Handler) serveGetAppcRouteInfo(w http.ResponseWriter, r *http.Request) {

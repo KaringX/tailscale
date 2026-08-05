@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package prefs
@@ -8,10 +8,9 @@ import (
 	"slices"
 	"time"
 
-	jsonv2 "github.com/go-json-experiment/json"
-	"github.com/go-json-experiment/json/jsontext"
+	jsonv2 "github.com/sagernet/tailscale/internal/godown/github.com/go-json-experiment/json"
+	"github.com/sagernet/tailscale/internal/godown/github.com/go-json-experiment/json/jsontext"
 	"github.com/sagernet/tailscale/types/opt"
-	"github.com/sagernet/tailscale/types/ptr"
 	"github.com/sagernet/tailscale/types/views"
 	"golang.org/x/exp/constraints"
 )
@@ -62,7 +61,7 @@ func (ls *List[T]) View() ListView[T] {
 
 // Clone returns a copy of l that aliases no memory with l.
 func (ls List[T]) Clone() *List[T] {
-	res := ptr.To(ls)
+	res := func() *List[T] { godownValue := ls; return &godownValue }()
 	if v, ok := ls.s.Value.GetOk(); ok {
 		res.s.Value.Set(append(v[:0:0], v...))
 	}

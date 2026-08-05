@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build ts_omit_tailnetlock
@@ -8,6 +8,7 @@ package tka
 import (
 	"crypto/ed25519"
 	"errors"
+	"time"
 
 	"github.com/sagernet/tailscale/types/key"
 	"github.com/sagernet/tailscale/types/logger"
@@ -157,3 +158,8 @@ func SignByCredential(privKey []byte, wrapped *NodeKeySignature, nodeKey key.Nod
 }
 
 func (s NodeKeySignature) String() string { return "" }
+
+type CompactionOptions struct {
+	MinChain int
+	MinAge   time.Duration
+}

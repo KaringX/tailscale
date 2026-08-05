@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package netmon
@@ -41,7 +41,12 @@ func isProblematicInterface(nif *net.Interface) bool {
 	// DoS each other by doing traffic amplification, both of them
 	// preferring/trying to use each other for transport. See:
 	// https://github.com/tailscale/tailscale/issues/1208
-	if strings.HasPrefix(name, "zt") || (runtime.GOOS == "windows" && strings.Contains(name, "ZeroTier")) {
+	// TODO(https://github.com/tailscale/tailscale/issues/18824): maybe exclude
+	// "WireGuard tunnel 0" as well on Windows (NetBird), but the name seems too
+	// generic where there is not a platform standard (on Linux wt0 is at least
+	// explicitly different from the WireGuard conventional default of wg0).
+	if strings.HasPrefix(name, "zt") || name == "wt0" /* NetBird */ ||
+		(runtime.GOOS == "windows" && strings.Contains(name, "ZeroTier")) {
 		return true
 	}
 	return false
@@ -149,12 +154,28 @@ type Interface struct {
 	Desc     string     // extra description (used on Windows)
 }
 
-func (i Interface) IsLoopback() bool { return isLoopback(i.Interface) }
-func (i Interface) IsUp() bool       { return isUp(i.Interface) }
+func (i Interface) IsLoopback() bool {
+	if i.Interface == nil {
+		return false
+	}
+	return isLoopback(i.Interface)
+}
+
+func (i Interface) IsUp() bool {
+	if i.Interface == nil {
+		return false
+	}
+	return isUp(i.Interface)
+}
+
 func (i Interface) Addrs() ([]net.Addr, error) {
 	if i.AltAddrs != nil {
 		return i.AltAddrs, nil
 	}
+	if i.Interface == nil {
+		return nil, nil
+	}
+
 	return i.Interface.Addrs()
 }
 
@@ -422,6 +443,91 @@ func (a Interface) Equal(b Interface) bool {
 	return true
 }
 
+// InterfaceDiff returns a human-readable summary of the differences between s
+// and s2 that would cause Equal to return false. It returns "" if the states
+// are equal. This is useful for debugging false link change events where the
+// State.String() output looks identical but Equal() returns false because it
+// checks fields not shown in String() (like interface Flags, MTU, HardwareAddr).
+func (s *State) InterfaceDiff(s2 *State) string {
+	if s == nil && s2 == nil {
+		return ""
+	}
+	if s == nil {
+		return "old=nil"
+	}
+	if s2 == nil {
+		return "new=nil"
+	}
+	var diffs []string
+	if s.HaveV6 != s2.HaveV6 {
+		diffs = append(diffs, fmt.Sprintf("HaveV6: %v->%v", s.HaveV6, s2.HaveV6))
+	}
+	if s.HaveV4 != s2.HaveV4 {
+		diffs = append(diffs, fmt.Sprintf("HaveV4: %v->%v", s.HaveV4, s2.HaveV4))
+	}
+	if s.IsExpensive != s2.IsExpensive {
+		diffs = append(diffs, fmt.Sprintf("IsExpensive: %v->%v", s.IsExpensive, s2.IsExpensive))
+	}
+	if s.DefaultRouteInterface != s2.DefaultRouteInterface {
+		diffs = append(diffs, fmt.Sprintf("DefaultRoute: %q->%q", s.DefaultRouteInterface, s2.DefaultRouteInterface))
+	}
+	if s.HTTPProxy != s2.HTTPProxy {
+		diffs = append(diffs, fmt.Sprintf("HTTPProxy: %q->%q", s.HTTPProxy, s2.HTTPProxy))
+	}
+	if s.PAC != s2.PAC {
+		diffs = append(diffs, fmt.Sprintf("PAC: %q->%q", s.PAC, s2.PAC))
+	}
+	if len(s.Interface) != len(s2.Interface) {
+		diffs = append(diffs, fmt.Sprintf("numInterfaces: %d->%d", len(s.Interface), len(s2.Interface)))
+	}
+	if len(s.InterfaceIPs) != len(s2.InterfaceIPs) {
+		diffs = append(diffs, fmt.Sprintf("numInterfaceIPs: %d->%d", len(s.InterfaceIPs), len(s2.InterfaceIPs)))
+	}
+	for iname, i := range s.Interface {
+		i2, ok := s2.Interface[iname]
+		if !ok {
+			diffs = append(diffs, fmt.Sprintf("if %s: removed", iname))
+			continue
+		}
+		if !i.Equal(i2) {
+			if i.Interface != nil && i2.Interface != nil {
+				if i.Flags != i2.Flags {
+					diffs = append(diffs, fmt.Sprintf("if %s flags: %v->%v", iname, i.Flags, i2.Flags))
+				}
+				if i.MTU != i2.MTU {
+					diffs = append(diffs, fmt.Sprintf("if %s MTU: %d->%d", iname, i.MTU, i2.MTU))
+				}
+				if i.Index != i2.Index {
+					diffs = append(diffs, fmt.Sprintf("if %s index: %d->%d", iname, i.Index, i2.Index))
+				}
+				if !bytes.Equal([]byte(i.HardwareAddr), []byte(i2.HardwareAddr)) {
+					diffs = append(diffs, fmt.Sprintf("if %s hwaddr: %v->%v", iname, i.HardwareAddr, i2.HardwareAddr))
+				}
+			}
+			if i.Desc != i2.Desc {
+				diffs = append(diffs, fmt.Sprintf("if %s desc: %q->%q", iname, i.Desc, i2.Desc))
+			}
+		}
+	}
+	for iname := range s2.Interface {
+		if _, ok := s.Interface[iname]; !ok {
+			diffs = append(diffs, fmt.Sprintf("if %s: added", iname))
+		}
+	}
+	for iname, vv := range s.InterfaceIPs {
+		vv2 := s2.InterfaceIPs[iname]
+		if !slices.Equal(vv, vv2) {
+			diffs = append(diffs, fmt.Sprintf("ips %s: %v->%v", iname, vv, vv2))
+		}
+	}
+	for iname := range s2.InterfaceIPs {
+		if _, ok := s.InterfaceIPs[iname]; !ok {
+			diffs = append(diffs, fmt.Sprintf("ips %s: added %v", iname, s2.InterfaceIPs[iname]))
+		}
+	}
+	return strings.Join(diffs, "; ")
+}
+
 func (s *State) HasPAC() bool { return s != nil && s.PAC != "" }
 
 // AnyInterfaceUp reports whether any interface seems like it has Internet access.
@@ -454,15 +560,22 @@ func hasTailscaleIP(pfxs []netip.Prefix) bool {
 }
 
 func isTailscaleInterface(name string, ips []netip.Prefix) bool {
+	// Sandboxed macOS and Plan9 (and anything else that explicitly calls SetTailscaleInterfaceProps).
+	tsIfName, err := TailscaleInterfaceName()
+	if err == nil {
+		// If we've been told the Tailscale interface name, use that.
+		return name == tsIfName
+	}
+
+	// The sandboxed app should (as of 1.92) set the tun interface name via SetTailscaleInterfaceProps
+	// early in the startup process.  The non-sandboxed app does not.
+	// TODO (barnstar):  If Wireguard created the tun device on darwin, it should know the name and it should
+	// be explicitly set instead checking addresses here.
 	if runtime.GOOS == "darwin" && strings.HasPrefix(name, "utun") && hasTailscaleIP(ips) {
-		// On macOS in the sandboxed app (at least as of
-		// 2021-02-25), we often see two utun devices
-		// (e.g. utun4 and utun7) with the same IPv4 and IPv6
-		// addresses. Just remove all utun devices with
-		// Tailscale IPs until we know what's happening with
-		// macOS NetworkExtensions and utun devices.
 		return true
 	}
+
+	// Windows, Linux...
 	return name == "Tailscale" || // as it is on Windows
 		strings.HasPrefix(name, "tailscale") // TODO: use --tun flag value, etc; see TODO in method doc
 }
@@ -485,9 +598,16 @@ func getState(optTSInterfaceName string) (*State, error) {
 		ifUp := ni.IsUp()
 		s.Interface[ni.Name] = ni
 		s.InterfaceIPs[ni.Name] = append(s.InterfaceIPs[ni.Name], pfxs...)
+
+		// Skip uninteresting interfaces
+		if IsInterestingInterface != nil && !IsInterestingInterface(ni, pfxs) {
+			return
+		}
+
 		if !ifUp || isTSInterfaceName || isTailscaleInterface(ni.Name, pfxs) {
 			return
 		}
+
 		for _, pfx := range pfxs {
 			if pfx.Addr().IsLoopback() {
 				continue
@@ -771,15 +891,11 @@ func (m *Monitor) HasCGNATInterface() (bool, error) {
 	hasCGNATInterface := false
 	cgnatRange := tsaddr.CGNATRange()
 	err := ForeachInterface(func(i Interface, pfxs []netip.Prefix) {
-		isTSInterfaceName := m.tsIfName != "" && i.Name == m.tsIfName
-		if hasCGNATInterface || !i.IsUp() || isTSInterfaceName || isTailscaleInterface(i.Name, pfxs) {
+		if hasCGNATInterface || !i.IsUp() || isTailscaleInterface(i.Name, pfxs) {
 			return
 		}
-		for _, pfx := range pfxs {
-			if cgnatRange.Overlaps(pfx) {
-				hasCGNATInterface = true
-				break
-			}
+		if slices.ContainsFunc(pfxs, cgnatRange.Overlaps) {
+			hasCGNATInterface = true
 		}
 	})
 	if err != nil {

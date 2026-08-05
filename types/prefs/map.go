@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package prefs
@@ -7,10 +7,9 @@ import (
 	"maps"
 	"net/netip"
 
-	jsonv2 "github.com/go-json-experiment/json"
-	"github.com/go-json-experiment/json/jsontext"
+	jsonv2 "github.com/sagernet/tailscale/internal/godown/github.com/go-json-experiment/json"
+	"github.com/sagernet/tailscale/internal/godown/github.com/go-json-experiment/json/jsontext"
 	"github.com/sagernet/tailscale/types/opt"
-	"github.com/sagernet/tailscale/types/ptr"
 	"github.com/sagernet/tailscale/types/views"
 	"golang.org/x/exp/constraints"
 )
@@ -44,7 +43,7 @@ func (m *Map[K, V]) View() MapView[K, V] {
 
 // Clone returns a copy of m that aliases no memory with m.
 func (m Map[K, V]) Clone() *Map[K, V] {
-	res := ptr.To(m)
+	res := func() *Map[K, V] { godownValue := m; return &godownValue }()
 	if v, ok := m.s.Value.GetOk(); ok {
 		res.s.Value.Set(maps.Clone(v))
 	}

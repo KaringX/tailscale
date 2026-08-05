@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package desktop
@@ -510,10 +510,13 @@ func sessionWatcherWndProc(hWnd windows.HWND, msg uint32, wParam, lParam uintptr
 }
 
 func pumpThreadMessages() {
-	var msg _MSG
-	for getMessage(&msg, 0, 0, 0) != 0 {
-		translateMessage(&msg)
-		dispatchMessage(&msg)
+	var p runtime.Pinner
+	defer p.Unpin()
+	msg := &_MSG{}
+	p.Pin(msg)
+	for getMessage(msg, 0, 0, 0) != 0 {
+		translateMessage(msg)
+		dispatchMessage(msg)
 	}
 }
 

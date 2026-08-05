@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package packet
@@ -47,7 +47,7 @@ type HeaderChecksummer interface {
 	Header
 
 	// WriteCheck writes the correct checksum into buf, which should
-	// be be the already-marshalled header and payload.
+	// be the already-marshalled header and payload.
 	WriteChecksum(buf []byte)
 }
 

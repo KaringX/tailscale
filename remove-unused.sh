@@ -16,8 +16,15 @@ function remove_unused() {
     internal/tooldeps \
     gokrazy/ \
     ipn/lapitest \
+    ipn/ipnlocal/ipnlocaltest \
     feature/taildrop \
-    feature/condregister/maybe_taildrop.go
+    feature/condregister/maybe_taildrop.go \
+    feature/ssh \
+    feature/tailnetlock \
+    feature/condregister/maybe_tailnetlock.go \
+    tool/updateflakes \
+    tsconsensus/ \
+    tsnet/example
 }
 
 remove_unused

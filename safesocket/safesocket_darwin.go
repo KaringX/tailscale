@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package safesocket
@@ -102,8 +102,8 @@ func SetCredentials(token string, port int) {
 
 // InitListenerDarwin initializes the listener for the CLI commands
 // and localapi HTTP server and sets the port/token.  This will override
-// any credentials set explicitly via SetCredentials().  Calling this mulitple times
-// has no effect.  The listener and it's corresponding token/port is initialized only once.
+// any credentials set explicitly via SetCredentials().  Calling this multiple times
+// has no effect.  The listener and its corresponding token/port is initialized only once.
 func InitListenerDarwin(sharedDir string) (*net.Listener, error) {
 	ssd.mu.Lock()
 	defer ssd.mu.Unlock()
@@ -323,11 +323,11 @@ func readMacosSameUserProof() (port int, token string, err error) {
 		subStr := []byte(".tailscale.ipn.macos/sameuserproof-")
 		for bs.Scan() {
 			line := bs.Bytes()
-			i := bytes.Index(line, subStr)
-			if i == -1 {
+			_, after, ok := bytes.Cut(line, subStr)
+			if !ok {
 				continue
 			}
-			f := strings.SplitN(string(line[i+len(subStr):]), "-", 2)
+			f := strings.SplitN(string(after), "-", 2)
 			if len(f) != 2 {
 				continue
 			}

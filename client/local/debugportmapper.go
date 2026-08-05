@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !ts_omit_debugportmapper
@@ -50,6 +50,9 @@ type DebugPortmapOpts struct {
 // process.
 //
 // opts can be nil; if so, default values will be used.
+//
+// API maturity: this method is not considered a stable API and is
+// subject to change between releases.
 func (lc *Client) DebugPortmap(ctx context.Context, opts *DebugPortmapOpts) (io.ReadCloser, error) {
 	vals := make(url.Values)
 	if opts == nil {
