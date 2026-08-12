@@ -200,6 +200,7 @@ type LocalBackend struct {
 	logFlushFunc             func()         // or nil if SetLogFlusher wasn't called
 	em                       *expiryManager // non-nil; TODO(nickkhyl): move to nodeBackend
 	sshAtomicBool            atomic.Bool    // TODO(nickkhyl): move to nodeBackend
+	externalSSHHostKeys      []string
 	// webClientAtomicBool controls whether the web client is running. This should
 	// be true unless the disable-web-client node attribute has been set.
 	webClientAtomicBool atomic.Bool // TODO(nickkhyl): move to nodeBackend
@@ -298,6 +299,7 @@ type LocalBackend struct {
 	prevIfState       *netmon.State
 	peerAPIServer     *peerAPIServer     // or nil
 	peerAPIListeners  []*peerAPIListener // TODO(nickkhyl): move to nodeBackend
+	peerDNSHandler    PeerDNSQueryHandler
 	loginFlags        controlclient.LoginFlags
 	notifyWatchers    map[string]*watchSession // by session ID
 	lastStatusTime    time.Time                // status.AsOf value of the last processed status update
@@ -414,6 +416,10 @@ func (b *LocalBackend) SetHardwareAttested() {
 // used to bind the node's identity to this device.
 func (b *LocalBackend) HardwareAttested() bool {
 	return b.hardwareAttested.Load()
+}
+
+func (b *LocalBackend) SetPeerDNSQueryHandler(handler PeerDNSQueryHandler) {
+	b.peerDNSHandler = handler
 }
 
 // HealthTracker returns the health tracker for the backend.
@@ -2803,7 +2809,7 @@ func (b *LocalBackend) updateFilterLocked(prefs ipn.PrefsView) {
 	localNets, _ := localNetsB.IPSet()
 	logNets, _ := logNetsB.IPSet()
 	var sshPol tailcfg.SSHPolicyView
-	if buildfeatures.HasSSH && haveNetmap && netMap.SSHPolicy != nil {
+	if (buildfeatures.HasSSH || len(b.externalSSHHostKeys) > 0) && haveNetmap && netMap.SSHPolicy != nil {
 		sshPol = netMap.SSHPolicy.View()
 	}
 
@@ -5428,51 +5434,12 @@ func (b *LocalBackend) routerConfigLocked(cfg *wgcfg.Config, prefs ipn.PrefsView
 		rs.NetfilterMode = preftype.NetfilterOff
 	}
 
-	// Sanity check: we expect the control server to program both a v4
-	// and a v6 default route, if default routing is on. Fill in
-	// blackhole routes appropriately if we're missing some. This is
-	// likely to break some functionality, but if the user expressed a
-	// preference for routing remotely, we want to avoid leaking
-	// traffic at the expense of functionality.
+	// sing-box manages its own routing: never install exit node default
+	// routes (or LAN-protection routes) into the system routing table.
 	if buildfeatures.HasUseExitNode && (prefs.ExitNodeID() != "" || prefs.ExitNodeIP().IsValid()) {
-		var default4, default6 bool
-		for _, route := range rs.Routes {
-			switch route {
-			case tsaddr.AllIPv4():
-				default4 = true
-			case tsaddr.AllIPv6():
-				default6 = true
-			}
-			if default4 && default6 {
-				break
-			}
-		}
-		if !default4 {
-			rs.Routes = append(rs.Routes, tsaddr.AllIPv4())
-		}
-		if !default6 {
-			rs.Routes = append(rs.Routes, tsaddr.AllIPv6())
-		}
-		internalIPs, externalIPs, err := internalAndExternalInterfaces()
-		if err != nil {
-			b.logf("failed to discover interface ips: %v", err)
-		}
-		switch runtime.GOOS {
-		case "linux", "windows", "darwin", "ios", "android":
-			rs.LocalRoutes = internalIPs // unconditionally allow access to guest VM networks
-			if prefs.ExitNodeAllowLANAccess() {
-				rs.LocalRoutes = append(rs.LocalRoutes, externalIPs...)
-			} else {
-				// Explicitly add routes to the local network so that we do not
-				// leak any traffic.
-				rs.Routes = append(rs.Routes, externalIPs...)
-			}
-			b.logf("allowing exit node access to local IPs: %v", rs.LocalRoutes)
-		default:
-			if prefs.ExitNodeAllowLANAccess() {
-				b.logf("warning: ExitNodeAllowLANAccess has no effect on " + runtime.GOOS)
-			}
-		}
+		rs.Routes = slices.DeleteFunc(rs.Routes, func(route netip.Prefix) bool {
+			return route.Bits() == 0
+		})
 	}
 
 	if slices.ContainsFunc(rs.LocalAddrs, tsaddr.PrefixIs4) {
@@ -5522,6 +5489,9 @@ func (b *LocalBackend) applyPrefsToHostinfoLocked(hi *tailcfg.Hostinfo, prefs ip
 		if err != nil {
 			b.logf("warning: unable to get SSH host keys, SSH will appear as disabled for this node: %v", err)
 		}
+	}
+	if len(sshHostKeys) == 0 && len(b.externalSSHHostKeys) > 0 {
+		sshHostKeys = b.externalSSHHostKeys
 	}
 	hi.SSH_HostKeys = sshHostKeys
 
@@ -5829,7 +5799,9 @@ func (b *LocalBackend) resetAuthURLLocked() {
 	b.authActor = nil
 }
 
-func (b *LocalBackend) ShouldRunSSH() bool { return b.sshAtomicBool.Load() && envknob.CanSSHD() }
+func (b *LocalBackend) ShouldRunSSH() bool {
+	return b.sshAtomicBool.Load() && envknob.CanSSHD() && len(b.externalSSHHostKeys) == 0
+}
 
 // ShouldRunWebClient reports whether the web client is being run
 // within this tailscaled instance. ShouldRunWebClient is safe to
