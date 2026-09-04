@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package internal contains miscellaneous functions and types
@@ -8,7 +8,7 @@ package internal
 import (
 	"bytes"
 
-	"github.com/go-json-experiment/json/jsontext"
+	"github.com/sagernet/tailscale/internal/godown/github.com/go-json-experiment/json/jsontext"
 	"github.com/sagernet/tailscale/types/lazy"
 	"github.com/sagernet/tailscale/util/testenv"
 	"github.com/sagernet/tailscale/version"

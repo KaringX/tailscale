@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package dns
@@ -6,7 +6,6 @@ package dns
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sagernet/tailscale/health"
+	godownerrors "github.com/sagernet/tailscale/internal/godown/std/errors"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/util/winutil"
 	"golang.org/x/sys/windows"
@@ -76,7 +76,7 @@ func (wm *wslManager) SetDNS(cfg OSConfig) error {
 	}
 	managers := make(map[string]*directManager)
 	for _, distro := range distros {
-		managers[distro] = newDirectManagerOnFS(wm.logf, wm.health, wslFS{
+		managers[distro] = newDirectManagerOnFS(wm.logf, wm.health, nil, wslFS{
 			user:   "root",
 			distro: distro,
 		})
@@ -150,6 +150,8 @@ type wslFS struct {
 	distro string
 }
 
+func (fs wslFS) ActualPath(name string) string { return name }
+
 func (fs wslFS) Stat(name string) (isRegular bool, err error) {
 	err = wslRun(fs.cmd("test", "-f", name))
 	if ee, _ := err.(*exec.ExitError); ee != nil {
@@ -174,8 +176,7 @@ func (fs wslFS) Truncate(name string) error { return fs.WriteFile(name, nil, 0o6
 
 func (fs wslFS) ReadFile(name string) ([]byte, error) {
 	b, err := wslCombinedOutput(fs.cmd("cat", "--", name))
-	var ee *exec.ExitError
-	if errors.As(err, &ee) && ee.ExitCode() == 1 {
+	if ee, ok := godownerrors.AsType[*exec.ExitError](err); ok && ee.ExitCode() == 1 {
 		return nil, os.ErrNotExist
 	}
 	return b, err

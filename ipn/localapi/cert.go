@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !ios && !android && !js && !ts_omit_acme
@@ -7,11 +7,14 @@ package localapi
 
 import (
 	"fmt"
+	"maps"
 	"net/http"
 	"strings"
 	"time"
 
+	godownerrors "github.com/sagernet/tailscale/internal/godown/std/errors"
 	"github.com/sagernet/tailscale/ipn/ipnlocal"
+	"github.com/sagernet/tailscale/tsweb"
 )
 
 func init() {
@@ -39,11 +42,15 @@ func (h *Handler) serveCert(w http.ResponseWriter, r *http.Request) {
 	}
 	pair, err := h.b.GetCertPEMWithValidity(r.Context(), domain, minValidity)
 	if err != nil {
-		// TODO(bradfitz): 500 is a little lazy here. The errors returned from
-		// GetCertPEM (and everywhere) should carry info info to get whether
-		// they're 400 vs 403 vs 500 at minimum. And then we should have helpers
-		// (in tsweb probably) to return an error that looks at the error value
-		// to determine the HTTP status code.
+		if hs, ok := godownerrors.AsType[tsweb.HTTPStatuser](err); ok {
+			resp := hs.HTTPStatus()
+			maps.Copy(w.Header(), resp.Header)
+			http.Error(w, resp.Msg, resp.Code)
+			return
+		}
+		// TODO(bradfitz): 500 is a little lazy. Other errors from GetCertPEM
+		// should also implement tsweb.HTTPStatuser (400 vs 403 vs 500 vs …)
+		// rather than falling through here.
 		http.Error(w, fmt.Sprint(err), 500)
 		return
 	}

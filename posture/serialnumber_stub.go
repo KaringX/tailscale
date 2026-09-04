@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // js: not implemented
@@ -12,6 +12,7 @@ package posture
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/util/syspolicy/policyclient"
@@ -19,5 +20,5 @@ import (
 
 // GetSerialNumber returns client machine serial number(s).
 func GetSerialNumbers(polc policyclient.Client, _ logger.Logf) ([]string, error) {
-	return nil, errors.New("not implemented")
+	return nil, fmt.Errorf("not implemented: %w", errors.ErrUnsupported)
 }

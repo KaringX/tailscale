@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !ts_omit_logtail
@@ -12,8 +12,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"expvar"
 	"fmt"
 	"io"
+	"iter"
 	"log"
 	mrand "math/rand/v2"
 	"net/http"
@@ -25,8 +27,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/go-json-experiment/json/jsontext"
 	"github.com/sagernet/tailscale/envknob"
+	jsonv2 "github.com/sagernet/tailscale/internal/godown/github.com/go-json-experiment/json"
+	"github.com/sagernet/tailscale/internal/godown/github.com/go-json-experiment/json/jsontext"
+	"github.com/sagernet/tailscale/metrics"
 	"github.com/sagernet/tailscale/net/netmon"
 	"github.com/sagernet/tailscale/net/sockstats"
 	"github.com/sagernet/tailscale/tstime"
@@ -54,7 +58,10 @@ const lowMemRatio = 4
 // but not too large to be a notable waste of memory if retained forever.
 const bufferSize = 4 << 10
 
-func NewLogger(cfg Config, logf tslogger.Logf) *Logger {
+// newLogger constructs a *Logger from cfg, applying defaults, but does not start
+// the background uploading goroutine. It is shared by [NewLogger] and the
+// stateless [UploadLogs].
+func newLogger(cfg Config) *Logger {
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = "https://" + DefaultHost
 	}
@@ -129,13 +136,164 @@ func NewLogger(cfg Config, logf tslogger.Logf) *Logger {
 	}
 	logger.SetSockstatsLabel(sockstats.LabelLogtailLogger)
 	logger.compressLogs = cfg.CompressLogs
+	logger.disabled.Store(cfg.Disabled)
+
+	return logger
+}
+
+// NewLogger returns a new Logger that splits logs as configured between local
+// logging facilities and uploading to a log server in the background.
+func NewLogger(cfg Config, logf tslogger.Logf) *Logger {
+	logger := newLogger(cfg)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	logger.uploadCancel = cancel
 
 	go logger.uploading(ctx)
-	logger.Write([]byte("logtail started"))
+	if envknob.Bool("TS_DEBUG_LOGTAIL") {
+		logger.Write([]byte("logtail started"))
+	}
 	return logger
+}
+
+// Logtail is the reserved "logtail" metadata member of a [LogEntry].
+//
+// Zero-valued fields are omitted when an entry is uploaded. [UploadLogs] fills
+// in any fields the caller leaves zero from its [Config] (e.g. ClientTime and
+// ProcID), so most callers can leave this empty.
+type Logtail struct {
+	// ClientTime is the time the entry was generated. If zero, [UploadLogs]
+	// fills it with the current time unless Config.SkipClientTime is set.
+	ClientTime time.Time `json:"client_time,omitzero"`
+	// ProcID is an ephemeral process identifier; see Config.IncludeProcID.
+	ProcID uint32 `json:"proc_id,omitzero"`
+	// ProcSeq is an ephemeral per-process sequence number; see
+	// Config.IncludeProcSequence.
+	ProcSeq uint64 `json:"proc_seq,omitzero"`
+}
+
+// LogEntry is a single log entry to be uploaded via [UploadLogs].
+//
+// It marshals to a JSON object whose reserved "logtail" member carries the
+// metadata in Logtail and whose remaining members are taken from Value, which
+// is inlined at the top level alongside "logtail".
+//
+// Value must marshal to a JSON object: T must be a Go struct (or pointer to
+// one), a Go map with a string key, or a [jsontext.Value] holding an object
+// (for example jsontext.Value(`{"text":"hello"}`)). This is enforced when the
+// entry is uploaded, not at compile time. Use T = [jsontext.Value] to mix
+// differently-shaped payloads in a single upload.
+type LogEntry[T any] struct {
+	Logtail Logtail `json:"logtail,omitzero"`
+	// The `inline` tag option was renamed to `embed` in Go 1.27's
+	// encoding/json/v2, but the pinned go-json-experiment module
+	// (used on older Go versions) only knows `inline`. Each
+	// implementation ignores the option it doesn't know, so specify
+	// both until we require Go 1.27 and drop `inline`.
+	//
+	//lint:ignore SA5008 staticcheck doesn't know Go 1.27's `embed` option yet
+	Value T `json:",inline,embed"`
+}
+
+// UploadLogs uploads entries to the log server described by conf and returns
+// once they have all been sent (or an upload fails). It returns the number of
+// entries that were successfully uploaded.
+//
+// It is a stateless alternative to [NewLogger] for callers that just want to
+// push a batch of log entries without the background uploader, ring buffer,
+// stderr echoing, or network-up gating that a [Logger] provides. Each entry is
+// marshaled to JSON, its [Logtail] metadata is filled in from conf where the
+// caller left it zero (honoring conf.SkipClientTime, conf.IncludeProcID, and
+// conf.IncludeProcSequence), and entries are batched up to the server's maximum
+// upload size and POSTed synchronously (compressed when conf.CompressLogs is
+// set).
+//
+// Unlike [Logger], UploadLogs does not retry: if a batch fails to upload it
+// returns the count of entries sent in prior batches and the error immediately,
+// and any remaining entries are not sent. The conf.Stderr and conf.Bus fields
+// are ignored.
+func UploadLogs[T any](ctx context.Context, conf Config, entries iter.Seq[LogEntry[T]]) (int, error) {
+	conf.Stderr = io.Discard // pure uploader: never echo to stderr
+	conf.Bus = nil           // no netmon/eventbus subscription for a one-shot
+	lg := newLogger(conf)
+
+	maxLen := cmp.Or(lg.maxUploadSize, maxSize)
+	if lg.lowMem {
+		maxLen /= lowMemRatio
+	}
+
+	// body accumulates a JSON array of encoded entries: "[e1,e2,...]".
+	// The framing mirrors Logger.drainPending.
+	body := make([]byte, 0, bufferSize) // reused across batches
+	body = append(body, '[')
+
+	// sent counts entries confirmed uploaded; pending counts entries
+	// accumulated in body but not yet uploaded. A successful sendBatch moves
+	// pending into sent.
+	var sent, pending int
+	sendBatch := func() error {
+		if len(body) <= len("[") {
+			return nil
+		}
+		out := bytes.TrimRight(body, ",")
+		out = append(out, ']')
+		origlen := -1 // sentinel value: uncompressed
+		// Don't attempt to compress tiny bodies; not worth the CPU cycles.
+		if lg.compressLogs && len(out) > 256 {
+			zbody := zstdframe.AppendEncode(nil, out,
+				zstdframe.FastestCompression, zstdframe.LowMemory(true))
+			// Only send it compressed if the bandwidth savings are sufficient.
+			if len(out)-len(zbody) > 64 {
+				origlen = len(out)
+				out = zbody
+			}
+		}
+		// upload is synchronous, so it is safe to reuse body's backing array
+		// for the next batch once upload returns.
+		if _, err := lg.upload(ctx, out, origlen); err != nil {
+			return err
+		}
+		body = body[:len("[")]
+		sent += pending
+		pending = 0
+		return nil
+	}
+
+	var procSeq uint64
+	for e := range entries {
+		if err := ctx.Err(); err != nil {
+			return sent, err
+		}
+
+		// Fill in metadata from conf, preserving any caller-set values.
+		if e.Logtail.ClientTime.IsZero() && !lg.skipClientTime {
+			e.Logtail.ClientTime = lg.clock.Now().UTC()
+		}
+		if e.Logtail.ProcID == 0 {
+			e.Logtail.ProcID = lg.procID
+		}
+		procSeq++
+		if lg.includeProcSequence {
+			e.Logtail.ProcSeq = procSeq
+		}
+
+		enc, err := jsonv2.Marshal(e)
+		if err != nil {
+			return sent, fmt.Errorf("logtail: encoding entry %d: %w", procSeq, err)
+		}
+
+		// Flush the current batch before adding an entry that would overflow it.
+		if len(body) > len("[") && len(body)+len(enc) > maxLen {
+			if err := sendBatch(); err != nil {
+				return sent, err
+			}
+		}
+		body = append(body, enc...)
+		body = append(body, ',')
+		pending++
+	}
+	err := sendBatch()
+	return sent, err
 }
 
 // Logger writes logs, splitting them as configured between local
@@ -169,6 +327,11 @@ type Logger struct {
 	procID              uint32
 	includeProcSequence bool
 
+	// disabled, when true, causes this logger to drop incoming log entries
+	// without buffering or uploading. It is independent of the process-wide
+	// Disable kill switch, which takes precedence. Toggled by SetEnabled.
+	disabled atomic.Bool
+
 	writeLock    sync.Mutex // guards procSequence, flushTimer, buffer.Write calls
 	procSequence uint64
 	flushTimer   tstime.TimerController // used when flushDelay is >0
@@ -179,6 +342,12 @@ type Logger struct {
 	shutdownStartMu sync.Mutex    // guards the closing of shutdownStart
 	shutdownStart   chan struct{} // closed when shutdown begins
 	shutdownDone    chan struct{} // closed when shutdown complete
+
+	// Metrics (see [Logger.ExpVar] for details).
+	uploadCalls   expvar.Int
+	failedCalls   expvar.Int
+	uploadedBytes expvar.Int
+	uploadingTime expvar.Int
 }
 
 type atomicSocktatsLabel struct{ p atomic.Uint32 }
@@ -402,7 +571,7 @@ func (lg *Logger) uploading(ctx context.Context) {
 				if retryAfter <= 0 {
 					retryAfter = mrand.N(30*time.Second) + 30*time.Second
 				}
-				tstime.Sleep(ctx, retryAfter)
+				tstime.Sleep(ctx, min(retryAfter, 5*time.Minute)) // ignore absurdly large retryAfter values
 			} else {
 				// Only print a success message after recovery.
 				if numFailures > 0 {
@@ -436,7 +605,7 @@ func (lg *Logger) internetUp() bool {
 // [netmon.ChangeDelta] events to detect whether the Internet is expected to be
 // reachable.
 func (lg *Logger) onChangeDelta(delta *netmon.ChangeDelta) {
-	if delta.New.AnyInterfaceUp() {
+	if delta.AnyInterfaceUp() {
 		fmt.Fprintf(lg.stderr, "logtail: internet back up\n")
 		lg.networkIsUp.Set()
 	} else {
@@ -455,7 +624,7 @@ func (lg *Logger) awaitInternetUp(ctx context.Context) {
 	}
 	upc := make(chan bool, 1)
 	defer lg.netMonitor.RegisterChangeCallback(func(delta *netmon.ChangeDelta) {
-		if delta.New.AnyInterfaceUp() {
+		if delta.AnyInterfaceUp() {
 			select {
 			case upc <- true:
 			default:
@@ -476,6 +645,9 @@ func (lg *Logger) awaitInternetUp(ctx context.Context) {
 // origlen indicates the pre-compression body length.
 // origlen of -1 indicates that the body is not compressed.
 func (lg *Logger) upload(ctx context.Context, body []byte, origlen int) (retryAfter time.Duration, err error) {
+	lg.uploadCalls.Add(1)
+	startUpload := time.Now()
+
 	const maxUploadTime = 45 * time.Second
 	ctx = sockstats.WithSockStats(ctx, lg.sockstatsLabel.Load(), lg.Logf)
 	ctx, cancel := context.WithTimeout(ctx, maxUploadTime)
@@ -515,15 +687,20 @@ func (lg *Logger) upload(ctx context.Context, body []byte, origlen int) (retryAf
 	lg.httpDoCalls.Add(1)
 	resp, err := lg.httpc.Do(req)
 	if err != nil {
+		lg.failedCalls.Add(1)
 		return 0, fmt.Errorf("log upload of %d bytes %s failed: %v", len(body), compressedNote, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		lg.failedCalls.Add(1)
 		n, _ := strconv.Atoi(resp.Header.Get("Retry-After"))
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
 		return time.Duration(n) * time.Second, fmt.Errorf("log upload of %d bytes %s failed %d: %s", len(body), compressedNote, resp.StatusCode, bytes.TrimSpace(b))
 	}
+
+	lg.uploadedBytes.Add(int64(len(body)))
+	lg.uploadingTime.Add(int64(time.Since(startUpload)))
 	return 0, nil
 }
 
@@ -545,12 +722,45 @@ func (lg *Logger) StartFlush() {
 	}
 }
 
+// ExpVar report metrics about the logger.
+//
+//   - counter_upload_calls: Total number of upload attempts.
+//
+//   - counter_upload_errors: Total number of upload attempts that failed.
+//
+//   - counter_uploaded_bytes: Total number of bytes successfully uploaded
+//     (which is calculated after compression is applied).
+//
+//   - counter_uploading_nsecs: Total number of nanoseconds spent uploading.
+//
+//   - buffer: An optional [metrics.Set] with metrics for the [Buffer].
+func (lg *Logger) ExpVar() expvar.Var {
+	m := new(metrics.Set)
+	m.Set("counter_upload_calls", &lg.uploadCalls)
+	m.Set("counter_upload_errors", &lg.failedCalls)
+	m.Set("counter_uploaded_bytes", &lg.uploadedBytes)
+	m.Set("counter_uploading_nsecs", &lg.uploadingTime)
+	if v, ok := lg.buffer.(interface{ ExpVar() expvar.Var }); ok {
+		m.Set("buffer", v.ExpVar())
+	}
+	return m
+}
+
 // logtailDisabled is whether logtail uploads to logcatcher are disabled.
 var logtailDisabled atomic.Bool
 
 // Disable disables logtail uploads for the lifetime of the process.
 func Disable() {
 	logtailDisabled.Store(true)
+}
+
+// SetEnabled enables or disables log uploading by lg. When disabled, log
+// entries passed to lg are dropped rather than buffered or uploaded; already
+// buffered entries may still drain. The process-wide [Disable] kill switch
+// takes precedence: if Disable has been called, SetEnabled(true) does not
+// re-enable uploads.
+func (lg *Logger) SetEnabled(enabled bool) {
+	lg.disabled.Store(!enabled)
 }
 
 var debugWakesAndUploads = envknob.RegisterBool("TS_DEBUG_LOGTAIL_WAKES")
@@ -572,7 +782,7 @@ func (lg *Logger) tryDrainWake() {
 
 func (lg *Logger) sendLocked(jsonBlob []byte) (int, error) {
 	tapSend(jsonBlob)
-	if logtailDisabled.Load() {
+	if logtailDisabled.Load() || lg.disabled.Load() {
 		return len(jsonBlob), nil
 	}
 
@@ -769,7 +979,7 @@ func (lg *Logger) appendTextOrJSONLocked(dst, src []byte, level int) []byte {
 	}
 
 	// Check whether the reserved logtail member occurs in the log data.
-	// If so, it is moved to the the logtail/error member.
+	// If so, it is moved to the logtail/error member.
 	const jsonSeperators = ",:"      // per RFC 8259, section 2
 	const jsonWhitespace = " \n\r\t" // per RFC 8259, section 2
 	var errDetail string
@@ -861,8 +1071,8 @@ func parseAndRemoveLogLevel(buf []byte) (level int, cleanBuf []byte) {
 	if bytes.Contains(buf, v2) {
 		return 2, bytes.ReplaceAll(buf, v2, nil)
 	}
-	if i := bytes.Index(buf, vJSON); i != -1 {
-		rest := buf[i+len(vJSON):]
+	if _, after, ok := bytes.Cut(buf, vJSON); ok {
+		rest := after
 		if len(rest) >= 2 {
 			v := rest[0]
 			if v >= '0' && v <= '9' {

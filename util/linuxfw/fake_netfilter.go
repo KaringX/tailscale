@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
@@ -19,6 +19,8 @@ type FakeNetfilterRunner struct {
 		TailscaleServiceIP netip.Addr
 		ClusterIP          netip.Addr
 	}
+	// clampedAddrs tracks addresses passed to ClampMSSToPMTU.
+	clampedAddrs []netip.Addr
 }
 
 // NewFakeNetfilterRunner creates a new FakeNetfilterRunner.
@@ -71,6 +73,8 @@ func (f *FakeNetfilterRunner) AddHooks() error                           { retur
 func (f *FakeNetfilterRunner) DelHooks(logf logger.Logf) error           { return nil }
 func (f *FakeNetfilterRunner) AddSNATRule() error                        { return nil }
 func (f *FakeNetfilterRunner) DelSNATRule() error                        { return nil }
+func (f *FakeNetfilterRunner) AddConnmarkSaveRule() error                { return nil }
+func (f *FakeNetfilterRunner) DelConnmarkSaveRule() error                { return nil }
 func (f *FakeNetfilterRunner) AddStatefulRule(tunname string) error      { return nil }
 func (f *FakeNetfilterRunner) DelStatefulRule(tunname string) error      { return nil }
 func (f *FakeNetfilterRunner) AddLoopbackRule(addr netip.Addr) error     { return nil }
@@ -81,9 +85,17 @@ func (f *FakeNetfilterRunner) DNATWithLoadBalancer(origDst netip.Addr, dsts []ne
 }
 func (f *FakeNetfilterRunner) EnsureSNATForDst(src, dst netip.Addr) error               { return nil }
 func (f *FakeNetfilterRunner) DNATNonTailscaleTraffic(tun string, dst netip.Addr) error { return nil }
-func (f *FakeNetfilterRunner) ClampMSSToPMTU(tun string, addr netip.Addr) error         { return nil }
-func (f *FakeNetfilterRunner) AddMagicsockPortRule(port uint16, network string) error   { return nil }
-func (f *FakeNetfilterRunner) DelMagicsockPortRule(port uint16, network string) error   { return nil }
+func (f *FakeNetfilterRunner) ClampMSSToPMTU(tun string, addr netip.Addr) error {
+	f.clampedAddrs = append(f.clampedAddrs, addr)
+	return nil
+}
+
+// GetClampedAddrs returns the addresses passed to ClampMSSToPMTU.
+func (f *FakeNetfilterRunner) GetClampedAddrs() []netip.Addr {
+	return f.clampedAddrs
+}
+func (f *FakeNetfilterRunner) AddMagicsockPortRule(port uint16, network string) error { return nil }
+func (f *FakeNetfilterRunner) DelMagicsockPortRule(port uint16, network string) error { return nil }
 func (f *FakeNetfilterRunner) DeletePortMapRuleForSvc(svc, tun string, targetIP netip.Addr, pm PortMap) error {
 	return nil
 }
@@ -95,3 +107,5 @@ func (f *FakeNetfilterRunner) DeleteSvc(svc, tun string, targetIPs []netip.Addr,
 func (f *FakeNetfilterRunner) EnsurePortMapRuleForSvc(svc, tun string, targetIP netip.Addr, pm PortMap) error {
 	return nil
 }
+func (f *FakeNetfilterRunner) AddExternalCGNATRules(mode CGNATMode, tunname string) error { return nil }
+func (f *FakeNetfilterRunner) DelExternalCGNATRules(mode CGNATMode, tunname string) error { return nil }

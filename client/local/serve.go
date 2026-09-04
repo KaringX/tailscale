@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !ts_omit_serve
@@ -17,6 +17,9 @@ import (
 // GetServeConfig return the current serve config.
 //
 // If the serve config is empty, it returns (nil, nil).
+//
+// API maturity: this method is not considered a stable API and is
+// subject to change between releases.
 func (lc *Client) GetServeConfig(ctx context.Context) (*ipn.ServeConfig, error) {
 	body, h, err := lc.sendWithHeaders(ctx, "GET", "/localapi/v0/serve-config", 200, nil, nil)
 	if err != nil {

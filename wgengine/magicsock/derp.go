@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package magicsock
@@ -6,6 +6,7 @@ package magicsock
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"maps"
 	"net"
@@ -98,7 +99,10 @@ type activeDerp struct {
 	createTime time.Time
 }
 
-var pickDERPFallbackForTests func() int
+var (
+	pickDERPFallbackForTests func() int
+	reSTUNHookForTests       func(why string)
+)
 
 // pickDERPFallback returns a non-zero but deterministic DERP node to
 // connect to.  This is only used if netcheck couldn't find the
@@ -151,7 +155,7 @@ var checkControlHealthDuringNearestDERPInTests = false
 // region that it selected and set (via setNearestDERP).
 //
 // c.mu must NOT be held.
-func (c *Conn) maybeSetNearestDERP(report *netcheck.Report) (preferredDERP int) {
+func (c *Conn) maybeSetNearestDERP(report *netcheck.Report, force bool) (preferredDERP int) {
 	// Don't change our PreferredDERP if we don't have a connection to
 	// control; if we don't, then we can't inform peers about a DERP home
 	// change, which breaks all connectivity. Even if this DERP region is
@@ -165,7 +169,10 @@ func (c *Conn) maybeSetNearestDERP(report *netcheck.Report) (preferredDERP int) 
 	//
 	// Despite the above behaviour, ensure that we set the nearest DERP if
 	// we don't currently have one set; any DERP server is better than
-	// none, even if not connected to control.
+	// none, even if not connected to control. The exception here is if we have
+	// a cached netmap with a previous DERP server. Retaining the previous DERP
+	// makes it easier for other nodes to find each other when control is not
+	// available.
 	var connectedToControl bool
 	if testenv.InTest() && !checkControlHealthDuringNearestDERPInTests {
 		connectedToControl = true
@@ -175,7 +182,7 @@ func (c *Conn) maybeSetNearestDERP(report *netcheck.Report) (preferredDERP int) 
 	c.mu.Lock()
 	myDerp := c.myDerp
 	c.mu.Unlock()
-	if !connectedToControl {
+	if !connectedToControl && !force {
 		if myDerp != 0 {
 			metricDERPHomeNoChangeNoControl.Add(1)
 			return myDerp
@@ -194,13 +201,30 @@ func (c *Conn) maybeSetNearestDERP(report *netcheck.Report) (preferredDERP int) 
 	}
 	if preferredDERP != myDerp {
 		c.logf(
-			"magicsock: home DERP changing from derp-%d [%dms] to derp-%d [%dms]",
-			c.myDerp, report.RegionLatency[myDerp].Milliseconds(), preferredDERP, report.RegionLatency[preferredDERP].Milliseconds())
+			"magicsock: home DERP changing from derp-%d [%dms] to derp-%d [%dms] (forced=%t)",
+			c.myDerp, report.RegionLatency[myDerp].Milliseconds(), preferredDERP, report.RegionLatency[preferredDERP].Milliseconds(), force)
 	}
 	if !c.setNearestDERP(preferredDERP) {
 		preferredDERP = 0
+	} else if preferredDERP != myDerp {
+		c.homeDERPChangedPub.Publish(HomeDERPChanged{Old: myDerp, New: preferredDERP})
 	}
 	return
+}
+
+// HomeDERPChanged is an event sent on the [eventbus.Bus] when a new home DERP
+// server has been selected. Its publisher is [magicsock.Coon]; its main
+// subscriber is [ipnlocal.LocalBackend] that updates the homeDERP used by the
+// netmap cache.
+// TODO(cmol): Move the subscriber to not inject into localBackend, but rather
+// into the netmap at the controlClient mapSession level once there is a stable
+// abstraction to use.
+type HomeDERPChanged struct {
+	Old, New int
+}
+
+func (c *Conn) ForceSetNearestDERP(regionID int) int {
+	return c.maybeSetNearestDERP(&netcheck.Report{PreferredDERP: regionID}, true)
 }
 
 func (c *Conn) derpRegionCodeLocked(regionID int) string {
@@ -213,17 +237,28 @@ func (c *Conn) derpRegionCodeLocked(regionID int) string {
 	return ""
 }
 
+// setHomeDERPGaugeLocked updates the home DERP gauge metric.
+//
+// c.mu must be held.
+func (c *Conn) setHomeDERPGaugeLocked(derpNum int) {
+	if c.homeDERPGauge != nil {
+		c.homeDERPGauge.Set(float64(derpNum))
+	}
+}
+
 // c.mu must NOT be held.
 func (c *Conn) setNearestDERP(derpNum int) (wantDERP bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.wantDerpLocked() {
 		c.myDerp = 0
+		c.setHomeDERPGaugeLocked(0)
 		c.health.SetMagicSockDERPHome(0, c.homeless)
 		return false
 	}
 	if c.homeless {
 		c.myDerp = 0
+		c.setHomeDERPGaugeLocked(0)
 		c.health.SetMagicSockDERPHome(0, c.homeless)
 		return false
 	}
@@ -235,6 +270,7 @@ func (c *Conn) setNearestDERP(derpNum int) (wantDERP bool) {
 		metricDERPHomeChange.Add(1)
 	}
 	c.myDerp = derpNum
+	c.setHomeDERPGaugeLocked(derpNum)
 	c.health.SetMagicSockDERPHome(derpNum, c.homeless)
 
 	if c.privateKey.IsZero() {
@@ -377,6 +413,10 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
 		return derpMap.Regions[regionID]
 	})
 	dc.HealthTracker = c.health
+	dc.AppName = c.derpAppName
+	if c.extraRootCAs != nil {
+		dc.TLSConfig = &tls.Config{RootCAs: c.extraRootCAs}
+	}
 
 	dc.SetCanAckPings(true)
 	dc.NotePreferred(c.myDerp == regionID)
@@ -421,7 +461,14 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
 
 	go c.runDerpReader(ctx, regionID, dc, wg, startGate)
 	go c.runDerpWriter(ctx, dc, ch, wg, startGate)
-	go c.derpActiveFunc()
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-startGate:
+			c.derpActiveFunc()
+		}
+	}()
 
 	return ad.writeCh
 }
@@ -703,6 +750,10 @@ func (c *Conn) processDERPReadResult(dm derpReadResult, b []byte) (n int, ep *en
 		return 0, nil
 	}
 
+	if c.onDERPRecv != nil && c.onDERPRecv(regionID, dm.src, b[:n]) {
+		return 0, nil
+	}
+
 	var ok bool
 	c.mu.Lock()
 	ep, ok = c.peerMap.endpointForNodeKey(dm.src)
@@ -723,6 +774,15 @@ func (c *Conn) processDERPReadResult(dm derpReadResult, b []byte) (n int, ep *en
 	return n, ep
 }
 
+// SendDERPPacketTo sends an arbitrary packet to the given node key via
+// the DERP relay for the given region. It creates the DERP connection
+// to the region if one doesn't already exist.
+func (c *Conn) SendDERPPacketTo(dstKey key.NodePublic, regionID int, pkt []byte) (sent bool, err error) {
+	return c.sendAddr(
+		netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(regionID)),
+		dstKey, pkt, false, false)
+}
+
 // SetOnlyTCP443 set whether the magicsock connection is restricted
 // to only using TCP port 443 outbound. If true, no UDP is allowed,
 // no STUN checks are performend, etc.
@@ -732,7 +792,24 @@ func (c *Conn) SetOnlyTCP443(v bool) {
 
 // SetDERPMap controls which (if any) DERP servers are used.
 // A nil value means to disable DERP; it's disabled by default.
+//
+// SetDERPMap triggers a ReSTUN after updating the map. Callers that want to
+// set the map without triggering a ReSTUN should use [Conn.SetDERPMapWithoutReSTUN]
+// instead.
 func (c *Conn) SetDERPMap(dm *tailcfg.DERPMap) {
+	c.setDERPMap(dm, true)
+}
+
+// SetDERPMapWithoutReSTUN is like [Conn.SetDERPMap] but does not trigger a
+// ReSTUN after updating the map.
+//
+// It is used for setting the map from a cache, so the homeDERP can be set
+// from cache before any STUN happens.
+func (c *Conn) SetDERPMapWithoutReSTUN(dm *tailcfg.DERPMap) {
+	c.setDERPMap(dm, false)
+}
+
+func (c *Conn) setDERPMap(dm *tailcfg.DERPMap, doReStun bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -789,8 +866,14 @@ func (c *Conn) SetDERPMap(dm *tailcfg.DERPMap) {
 		}
 	}
 
-	go c.ReSTUN("derp-map-update")
+	if doReStun {
+		if reSTUNHookForTests != nil {
+			reSTUNHookForTests("derp-map-update")
+		}
+		go c.ReSTUN("derp-map-update")
+	}
 }
+
 func (c *Conn) wantDerpLocked() bool { return c.derpMap != nil }
 
 // c.mu must be held.

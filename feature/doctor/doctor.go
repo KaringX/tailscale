@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // The doctor package registers the "doctor" problem diagnosis support into the
@@ -63,7 +63,7 @@ func visitDoctor(ctx context.Context, b *ipnlocal.LocalBackend, logf logger.Logf
 	// IPs; this can interfere with our ability to connect to the Tailscale
 	// controlplane.
 	checks = append(checks, doctor.CheckFunc("dns-resolvers", func(_ context.Context, logf logger.Logf) error {
-		nm := b.NetMap()
+		nm := b.NetMapNoPeers()
 		if nm == nil {
 			return nil
 		}

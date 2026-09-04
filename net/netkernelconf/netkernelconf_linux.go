@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux && !android
@@ -48,7 +48,7 @@ func CheckUDPGROForwarding(tunInterface, defaultRouteInterface string) (warn, er
 	}
 	defaultHasRxWant, ok := defaultFeatures[rxWantFeature]
 	if !ok {
-		// unlikely the feature is nonexistant with txFeature in the TUN driver
+		// unlikely the feature is nonexistent with txFeature in the TUN driver
 		// being added to the kernel later than rxWantFeature, but let's be sure
 		return nil, nil
 	}

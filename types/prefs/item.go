@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package prefs
@@ -6,10 +6,9 @@ package prefs
 import (
 	"fmt"
 
-	jsonv2 "github.com/go-json-experiment/json"
-	"github.com/go-json-experiment/json/jsontext"
+	jsonv2 "github.com/sagernet/tailscale/internal/godown/github.com/go-json-experiment/json"
+	"github.com/sagernet/tailscale/internal/godown/github.com/go-json-experiment/json/jsontext"
 	"github.com/sagernet/tailscale/types/opt"
-	"github.com/sagernet/tailscale/types/ptr"
 	"github.com/sagernet/tailscale/types/views"
 	"github.com/sagernet/tailscale/util/must"
 )
@@ -47,7 +46,7 @@ func (i *Item[T]) SetManagedValue(val T) {
 // It is a runtime error to call [Item.Clone] if T contains pointers
 // but does not implement [views.Cloner].
 func (i Item[T]) Clone() *Item[T] {
-	res := ptr.To(i)
+	res := func() *Item[T] { godownValue := i; return &godownValue }()
 	if v, ok := i.ValueOk(); ok {
 		res.s.Value.Set(must.Get(deepClone(v)))
 	}

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package packet
@@ -52,6 +52,11 @@ type ICMP6Code uint8
 
 const (
 	ICMP6NoCode ICMP6Code = 0
+
+	// ICMP6AddressUnreachable is the code used with ICMP6Unreachable to
+	// indicate that the destination address could not be reached. It is
+	// the IPv6 equivalent of ICMP4HostUnreachable.
+	ICMP6AddressUnreachable ICMP6Code = 3
 )
 
 // ICMP6Header is an IPv4+ICMPv4 header.

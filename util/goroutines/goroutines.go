@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // The goroutines package contains utilities for tracking and getting active goroutines.
@@ -52,7 +52,7 @@ func scrubHex(buf []byte) []byte {
 			in[0] = '?'
 			return
 		}
-		v := []byte(fmt.Sprintf("v%d%%%d", len(saw)+1, u64%8))
+		v := fmt.Appendf(nil, "v%d%%%d", len(saw)+1, u64%8)
 		saw[inStr] = v
 		copy(in, v)
 	})

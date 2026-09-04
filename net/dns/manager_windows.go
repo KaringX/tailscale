@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package dns
@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"net/netip"
 	"os"
@@ -26,10 +27,12 @@ import (
 	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/util/dnsname"
+	"github.com/sagernet/tailscale/util/eventbus"
 	"github.com/sagernet/tailscale/util/syspolicy/pkey"
 	"github.com/sagernet/tailscale/util/syspolicy/policyclient"
 	"github.com/sagernet/tailscale/util/syspolicy/ptype"
 	"github.com/sagernet/tailscale/util/winutil"
+	"github.com/sagernet/tailscale/util/winutil/winenv"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
@@ -57,8 +60,8 @@ type windowsManager struct {
 
 // NewOSConfigurator created a new OS configurator.
 //
-// The health tracker and the knobs may be nil.
-func NewOSConfigurator(logf logger.Logf, health *health.Tracker, polc policyclient.Client, knobs *controlknobs.Knobs, interfaceName string) (OSConfigurator, error) {
+// The health tracker, eventbus and the knobs may be nil.
+func NewOSConfigurator(logf logger.Logf, health *health.Tracker, bus *eventbus.Bus, polc policyclient.Client, knobs *controlknobs.Knobs, interfaceName string) (OSConfigurator, error) {
 	if polc == nil {
 		panic("nil policyclient.Client")
 	}
@@ -75,7 +78,7 @@ func NewOSConfigurator(logf logger.Logf, health *health.Tracker, polc policyclie
 	}
 
 	var err error
-	if ret.unregisterPolicyChangeCb, err = polc.RegisterChangeCallback(ret.sysPolicyChanged); err != nil {
+	if ret.unregisterPolicyChangeCb, err = polc.RegisterChangeCallback("", ret.sysPolicyChanged); err != nil {
 		logf("error registering policy change callback: %v", err) // non-fatal
 	}
 
@@ -144,7 +147,7 @@ func (m *windowsManager) setSplitDNS(resolvers []netip.Addr, domains []dnsname.F
 		return fmt.Errorf("Split DNS unsupported on this Windows version")
 	}
 
-	defer m.nrptDB.Refresh()
+	defer m.nrptDB.NotifyPolicyChanged()
 	if len(resolvers) == 0 {
 		return m.nrptDB.DelAllRuleKeys()
 	}
@@ -244,7 +247,13 @@ func (m *windowsManager) setHosts(hosts []*HostEntry) error {
 	}
 	hostsFile := filepath.Join(systemDir, "drivers", "etc", "hosts")
 	b, err := os.ReadFile(hostsFile)
-	if err != nil {
+	switch {
+	case err == nil:
+		// Continue.
+	case errors.Is(err, fs.ErrNotExist):
+		// Non-fatal, we'll just create a new hosts file.
+		m.logf("failed to read the hosts file: %v", err)
+	default:
 		return err
 	}
 	outB, err := setTailscaleHosts(m.logf, b, hosts)
@@ -353,6 +362,10 @@ func (m *windowsManager) disableLocalDNSOverrideViaNRPT() bool {
 	return m.knobs != nil && m.knobs.DisableLocalDNSOverrideViaNRPT.Load()
 }
 
+func (m *windowsManager) disableHostsFileUpdates() bool {
+	return m.knobs != nil && m.knobs.DisableHostsFileUpdates.Load()
+}
+
 func (m *windowsManager) SetDNS(cfg OSConfig) error {
 	// We can configure Windows DNS in one of two ways:
 	//
@@ -398,7 +411,15 @@ func (m *windowsManager) SetDNS(cfg OSConfig) error {
 		if err := m.setSplitDNS(resolvers, domains); err != nil {
 			return err
 		}
-		if err := m.setHosts(nil); err != nil {
+		var hosts []*HostEntry
+		if !m.disableHostsFileUpdates() && winenv.IsDomainJoined() {
+			// On domain-joined Windows devices the primary search domain (the one the device is joined to)
+			// always takes precedence over other search domains. This breaks MagicDNS when we are the primary
+			// resolver on the device (see #18712). To work around this Windows behavior, we should write MagicDNS
+			// host names the hosts file just as we do when we're not the primary resolver.
+			hosts = cfg.Hosts
+		}
+		if err := m.setHosts(hosts); err != nil {
 			return err
 		}
 		if err := m.setPrimaryDNS(cfg.Nameservers, cfg.SearchDomains); err != nil {
@@ -420,12 +441,14 @@ func (m *windowsManager) SetDNS(cfg OSConfig) error {
 			return err
 		}
 
-		// As we are not the primary resolver in this setup, we need to
-		// explicitly set some single name hosts to ensure that we can resolve
-		// them quickly and get around the 2.3s delay that otherwise occurs due
-		// to multicast timeouts.
-		if err := m.setHosts(cfg.Hosts); err != nil {
-			return err
+		if !m.disableHostsFileUpdates() {
+			// As we are not the primary resolver in this setup, we need to
+			// explicitly set some single name hosts to ensure that we can resolve
+			// them quickly and get around the 2.3s delay that otherwise occurs due
+			// to multicast timeouts.
+			if err := m.setHosts(cfg.Hosts); err != nil {
+				return err
+			}
 		}
 	}
 

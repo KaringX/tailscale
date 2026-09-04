@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package prober
@@ -17,6 +17,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -31,6 +32,7 @@ import (
 	"github.com/sagernet/tailscale/derp"
 	"github.com/sagernet/tailscale/derp/derphttp"
 	"github.com/sagernet/tailscale/net/netmon"
+	"github.com/sagernet/tailscale/net/netutil"
 	"github.com/sagernet/tailscale/net/stun"
 	"github.com/sagernet/tailscale/net/tstun"
 	"github.com/sagernet/tailscale/syncs"
@@ -423,7 +425,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 	// for packets up to their timeout. As records age out of the front of this
 	// list, if the associated packet arrives, we won't have a txRecord for it
 	// and will consider it to have timed out.
-	txRecords := make([]txRecord, 0, packetsPerSecond*int(packetTimeout.Seconds()))
+	txRecords := make([]txRecord, 0, int(math.Ceil(float64(packetsPerSecond)*packetTimeout.Seconds()))+1)
 	var txRecordsMu sync.Mutex
 
 	// applyTimeouts walks over txRecords and expires any records that are older
@@ -435,7 +437,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 		now := time.Now()
 		recs := txRecords[:0]
 		for _, r := range txRecords {
-			if now.Sub(r.at) > packetTimeout {
+			if now.Sub(r.at) >= packetTimeout {
 				packetsDropped.Add(1)
 			} else {
 				recs = append(recs, r)
@@ -451,9 +453,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 	pkt := make([]byte, 260) // the same size as a CallMeMaybe packet observed on a Tailscale client.
 	crand.Read(pkt)
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		t := time.NewTicker(time.Second / time.Duration(packetsPerSecond))
 		defer t.Stop()
 
@@ -481,13 +481,11 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 				}
 			}
 		}
-	}()
+	})
 
 	// Receive the packets.
 	recvFinishedC := make(chan error, 1)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		defer close(recvFinishedC) // to break out of 'select' below.
 		fromDERPPubKey := fromc.SelfPublicKey()
 		for {
@@ -531,7 +529,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 				// Loop.
 			}
 		}
-	}()
+	})
 
 	select {
 	case <-ctx.Done():
@@ -1213,7 +1211,7 @@ func newConn(ctx context.Context, dm *tailcfg.DERPMap, n *tailcfg.DERPNode, isPr
 var httpOrFileClient = &http.Client{Transport: httpOrFileTransport()}
 
 func httpOrFileTransport() http.RoundTripper {
-	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr := netutil.NewDefaultTransport()
 	tr.RegisterProtocol("file", http.NewFileTransport(http.Dir("/")))
 	return tr
 }

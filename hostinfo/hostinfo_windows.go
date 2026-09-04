@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package hostinfo
@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/sagernet/tailscale/types/ptr"
 	"github.com/sagernet/tailscale/util/winutil"
 	"github.com/sagernet/tailscale/util/winutil/winenv"
 	"golang.org/x/sys/windows"
@@ -23,9 +22,9 @@ func init() {
 }
 
 var (
-	lazyDistroName  = &lazyAtomicValue[string]{f: ptr.To(distroNameWindows)}
-	lazyOSVersion   = &lazyAtomicValue[string]{f: ptr.To(osVersionWindows)}
-	lazyPackageType = &lazyAtomicValue[string]{f: ptr.To(packageTypeWindows)}
+	lazyDistroName  = &lazyAtomicValue[string]{f: func() *func() string { godownValue := distroNameWindows; return &godownValue }()}
+	lazyOSVersion   = &lazyAtomicValue[string]{f: func() *func() string { godownValue := osVersionWindows; return &godownValue }()}
+	lazyPackageType = &lazyAtomicValue[string]{f: func() *func() string { godownValue := packageTypeWindows; return &godownValue }()}
 )
 
 func distroNameWindows() string {

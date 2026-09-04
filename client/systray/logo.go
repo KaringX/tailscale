@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build cgo || !darwin
@@ -11,6 +11,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"log"
 	"runtime"
 	"sync"
 	"time"
@@ -204,11 +205,48 @@ var (
 )
 
 var (
-	bg   = color.NRGBA{0, 0, 0, 255}
-	fg   = color.NRGBA{255, 255, 255, 255}
-	gray = color.NRGBA{255, 255, 255, 102}
-	red  = color.NRGBA{229, 111, 74, 255}
+	black       = color.NRGBA{0, 0, 0, 255}
+	white       = color.NRGBA{255, 255, 255, 255}
+	darkGray    = color.NRGBA{102, 102, 102, 255}
+	lightGray   = color.NRGBA{153, 153, 153, 255}
+	red         = color.NRGBA{229, 111, 74, 255}
+	transparent = color.NRGBA{}
+
+	// default values to dark theme
+	bg   = black
+	fg   = white
+	gray = darkGray
 )
+
+// SetTheme sets the color theme of the systray icon.
+//
+// Supported themes are:
+//   - dark       - white and gray dots over black background
+//   - dark:nobg  - white and grey dots over transparent background
+//   - light      - black and gray dots over white background
+//   - light:nobg - black and grey dots over transparent background
+func SetTheme(theme string) {
+	switch theme {
+	case "dark":
+		bg = black
+		fg = white
+		gray = darkGray
+	case "dark:nobg":
+		bg = transparent
+		fg = white
+		gray = darkGray
+	case "light":
+		bg = white
+		fg = black
+		gray = lightGray
+	case "light:nobg":
+		bg = transparent
+		fg = black
+		gray = lightGray
+	default:
+		log.Printf("unknown theme: %q", theme)
+	}
+}
 
 // render returns a PNG image of the logo.
 func (logo tsLogo) render() *bytes.Buffer {
@@ -233,8 +271,8 @@ func (logo tsLogo) renderWithBorder(borderUnits int) *bytes.Buffer {
 		dc.InvertMask()
 	}
 
-	for y := 0; y < 3; y++ {
-		for x := 0; x < 3; x++ {
+	for y := range 3 {
+		for x := range 3 {
 			px := (borderUnits + 1 + 3*x) * radius
 			py := (borderUnits + 1 + 3*y) * radius
 			col := fg

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package driveimpl
@@ -102,7 +102,7 @@ func (s *FileServer) ClearSharesLocked() {
 // has been called first.
 func (s *FileServer) AddShareLocked(share, path string) {
 	s.shareHandlers[share] = &webdav.Handler{
-		FileSystem: &birthTimingFS{webdav.Dir(path)},
+		FileSystem: &birthTimingFS{&normalizingFS{webdav.Dir(path)}},
 		LockSystem: webdav.NewMemLS(),
 	}
 }

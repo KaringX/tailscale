@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 
+	godownerrors "github.com/sagernet/tailscale/internal/godown/std/errors"
 	"golang.org/x/sys/unix"
 )
 
@@ -42,8 +44,7 @@ func errCode(err error) int {
 	if err == nil {
 		return 0
 	}
-	var e *exec.ExitError
-	if ok := errors.As(err, &e); ok {
+	if e, ok := godownerrors.AsType[*exec.ExitError](err); ok {
 		return e.ExitCode()
 	}
 	s := err.Error()
@@ -96,12 +97,7 @@ func newRunGroup(okCode []int, runner commandRunner) *runGroup {
 
 func (rg *runGroup) okCode(err error) bool {
 	got := errCode(err)
-	for _, want := range rg.OkCode {
-		if got == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(rg.OkCode, got)
 }
 
 func (rg *runGroup) Output(args ...string) []byte {

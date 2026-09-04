@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package packet
@@ -49,6 +49,10 @@ type ICMP4Code uint8
 
 const (
 	ICMP4NoCode ICMP4Code = 0
+
+	// ICMP4HostUnreachable is the code used with ICMP4Unreachable to
+	// indicate that the destination host could not be reached.
+	ICMP4HostUnreachable ICMP4Code = 1
 )
 
 // ICMP4Header is an IPv4+ICMPv4 header.

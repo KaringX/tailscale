@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Both the desktop session manager and multi-user support
@@ -23,7 +23,7 @@ import (
 )
 
 // featureName is the name of the feature implemented by this package.
-// It is also the the [desktopSessionsExt] name and the log prefix.
+// It is also the [desktopSessionsExt] name and the log prefix.
 const featureName = "desktop-sessions"
 
 func init() {

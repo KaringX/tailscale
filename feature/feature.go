@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package feature tracks which features are linked into the binary.
@@ -20,6 +20,14 @@ var in = map[string]bool{}
 // The returned map should not be modified by the caller,
 // not accessed concurrently with calls to Register.
 func Registered() map[string]bool { return in }
+
+// IsRegistered reports whether the named feature package's init
+// function has run and registered itself via [Register] in this
+// binary. It is distinct from the compile-time [buildfeatures]
+// constants: a feature package can be present in the binary but not
+// imported (e.g. tsnet deliberately does not import many features),
+// in which case its init does not run.
+func IsRegistered(name string) bool { return in[name] }
 
 // Register notes that the named feature is linked into the binary.
 func Register(name string) {

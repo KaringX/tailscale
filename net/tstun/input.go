@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/sagernet/tailscale/feature/buildfeatures"
 	"github.com/sagernet/tailscale/net/packet"
 	"github.com/sagernet/tailscale/wgengine/filter"
 	"github.com/sagernet/wireguard-go/device"
@@ -86,13 +85,6 @@ func (t *Wrapper) InputPackets(packets [][]byte) ([][]byte, error) {
 			if response != filter.Accept {
 				metricPacketOutDrop.Add(1)
 				continue
-			}
-		}
-		if buildfeatures.HasLazyWG {
-			if m := t.destIPActivity.Load(); m != nil {
-				if fn := m[p.Dst.Addr()]; fn != nil {
-					fn()
-				}
 			}
 		}
 		buffer := pkt

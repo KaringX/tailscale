@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipn
@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -138,7 +139,10 @@ type TCPPortHandler struct {
 	// It is mutually exclusive with TCPForward.
 	HTTP bool `json:",omitempty"`
 
-	// TCPForward is the IP:port to forward TCP connections to.
+	// TCPForward is the address to forward TCP connections to.
+	// It is either a host:port (e.g. "127.0.0.1:3128", "localhost:5432")
+	// or a Unix socket path prefixed with "unix:"
+	// (e.g. "unix:/var/run/app.sock" or "unix:relative.sock").
 	// Whether or not TLS is terminated by tailscaled depends on
 	// TerminateTLS.
 	//
@@ -190,7 +194,7 @@ func (sc *ServeConfig) WebHandlerExists(svcName tailcfg.ServiceName, hp HostPort
 }
 
 // GetWebHandler returns the HTTPHandler for the given host:port and mount point.
-// Returns nil if the handler does not exist.
+// It returns nil if the handler does not exist.
 func (sc *ServeConfig) GetWebHandler(svcName tailcfg.ServiceName, hp HostPort, mount string) *HTTPHandler {
 	if sc == nil {
 		return nil
@@ -260,6 +264,46 @@ func (sc *ServeConfig) HasPathHandler() bool {
 		}
 	}
 
+	return false
+}
+
+// IsServingUnixAny reports whether ServeConfig is serving Unix targets on any
+// port or web handler.
+func (sc *ServeConfig) IsServingUnixAny() bool {
+	if sc == nil {
+		return false
+	}
+	for _, fgSrvCfg := range sc.Foreground {
+		if fgSrvCfg.IsServingUnixAny() {
+			return true
+		}
+	}
+	for _, ph := range sc.TCP {
+		if strings.HasPrefix(ph.TCPForward, "unix:") {
+			return true
+		}
+	}
+	for _, web := range sc.Web {
+		for _, h := range web.Handlers {
+			if strings.HasPrefix(h.Proxy, "unix:") {
+				return true
+			}
+		}
+	}
+	for _, svcCfg := range sc.Services {
+		for _, ph := range svcCfg.TCP {
+			if strings.HasPrefix(ph.TCPForward, "unix:") {
+				return true
+			}
+		}
+		for _, web := range svcCfg.Web {
+			for _, h := range web.Handlers {
+				if strings.HasPrefix(h.Proxy, "unix:") {
+					return true
+				}
+			}
+		}
+	}
 	return false
 }
 
@@ -421,10 +465,10 @@ func (sc *ServeConfig) SetWebHandler(handler *HTTPHandler, host string, port uin
 	}
 }
 
-// SetTCPForwarding sets the fwdAddr (IP:port form) to which to forward
-// connections from the given port. If terminateTLS is true, TLS connections
-// are terminated with only the given host name permitted before passing them
-// to the fwdAddr.
+// SetTCPForwarding sets the fwdAddr to which to forward connections from the
+// given port. fwdAddr is either an IP:port or "unix:/path/to/socket".
+// If terminateTLS is true, TLS connections are terminated with only the given
+// host name permitted before passing them to the fwdAddr.
 //
 // If proxyProtocol is non-zero, the corresponding PROXY protocol version
 // header is sent before forwarding the connection.
@@ -432,24 +476,38 @@ func (sc *ServeConfig) SetTCPForwarding(port uint16, fwdAddr string, terminateTL
 	if sc == nil {
 		sc = new(ServeConfig)
 	}
-	tcpPortHandler := &sc.TCP
-	if svcName := tailcfg.AsServiceName(host); svcName != "" {
-		svcConfig, ok := sc.Services[svcName]
-		if !ok {
-			svcConfig = new(ServiceConfig)
-			mak.Set(&sc.Services, svcName, svcConfig)
-		}
-		tcpPortHandler = &svcConfig.TCP
-	}
-
-	handler := &TCPPortHandler{
+	mak.Set(&sc.TCP, port, &TCPPortHandler{
 		TCPForward:    fwdAddr,
 		ProxyProtocol: proxyProtocol, // can be 0
-	}
+	})
+
 	if terminateTLS {
-		handler.TerminateTLS = host
+		sc.TCP[port].TerminateTLS = host
 	}
-	mak.Set(tcpPortHandler, port, handler)
+}
+
+// SetTCPForwardingForService sets the fwdAddr to which to forward connections
+// from the given port on the service. fwdAddr is either a host:port or
+// "unix:/path" (absolute or relative). If terminateTLS is true, TLS connections
+// are terminated, with only the FQDN that corresponds to the given service
+// being permitted, before passing them to the fwdAddr.
+func (sc *ServeConfig) SetTCPForwardingForService(port uint16, fwdAddr string, terminateTLS bool, svcName tailcfg.ServiceName, proxyProtocol int, magicDNSSuffix string) {
+	if sc == nil {
+		sc = new(ServeConfig)
+	}
+	svcConfig, ok := sc.Services[svcName]
+	if !ok {
+		svcConfig = new(ServiceConfig)
+		mak.Set(&sc.Services, svcName, svcConfig)
+	}
+	mak.Set(&svcConfig.TCP, port, &TCPPortHandler{
+		TCPForward:    fwdAddr,
+		ProxyProtocol: proxyProtocol, // can be 0
+	})
+
+	if terminateTLS {
+		svcConfig.TCP[port].TerminateTLS = fmt.Sprintf("%s.%s", svcName.WithoutPrefix(), magicDNSSuffix)
+	}
 }
 
 // SetFunnel sets the sc.AllowFunnel value for the given host and port.
@@ -659,7 +717,7 @@ func CheckFunnelPort(wantedPort uint16, node *ipnstate.PeerStatus) error {
 		return deny("")
 	}
 	wantedPortString := strconv.Itoa(int(wantedPort))
-	for _, ps := range strings.Split(portsStr, ",") {
+	for ps := range strings.SplitSeq(portsStr, ",") {
 		if ps == "" {
 			continue
 		}
@@ -711,6 +769,21 @@ func ExpandProxyTargetValue(target string, supportedSchemes []string, defaultSch
 	// support target being a port number
 	if port, err := strconv.ParseUint(target, 10, 16); err == nil {
 		return fmt.Sprintf("%s://%s:%d", defaultScheme, host, port), nil
+	}
+
+	// handle unix: scheme specially - it doesn't use standard URL format
+	if strings.HasPrefix(target, "unix:") {
+		if !slices.Contains(supportedSchemes, "unix") {
+			return "", fmt.Errorf("unix sockets are not supported for this target type")
+		}
+		if runtime.GOOS == "windows" {
+			return "", fmt.Errorf("unix socket serve target is not supported on Windows")
+		}
+		path := strings.TrimPrefix(target, "unix:")
+		if path == "" {
+			return "", fmt.Errorf("unix socket path cannot be empty")
+		}
+		return target, nil
 	}
 
 	hasScheme := true

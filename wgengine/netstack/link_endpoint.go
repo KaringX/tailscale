@@ -1,10 +1,9 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package netstack
 
 import (
-	"bytes"
 	"context"
 	"sync"
 
@@ -104,7 +103,7 @@ const (
 // linkEndpoint implements stack.LinkEndpoint and stack.GSOEndpoint. Outbound
 // packets written by gVisor towards Tailscale are stored in a channel.
 // Inbound is fed to gVisor via injectInbound or gro. This is loosely
-// modeled after github.com/sagernet/gvisor/pkg/tcpip/link/channel.Endpoint.
+// modeled after gvisor.dev/pkg/tcpip/link/channel.Endpoint.
 type linkEndpoint struct {
 	SupportedGSOKind stack.SupportedGSO
 	supportedGRO     supportedGRO
@@ -202,38 +201,41 @@ func (ep *linkEndpoint) injectInbound(p *packet.Parsed) {
 	pkt.DecRef()
 }
 
-// injectInboundPacketBuffer takes a *stack.PacketBuffer produced for outbound
-// (read from ep.q) and re-delivers it inbound on the same NIC. Used to loop
-// gVisor-originated packets whose destination is one of our own Tailscale IPs
-// back into the stack, replacing gVisor's HandleLocal fast-path without
-// enabling its martian-source check (which is incompatible with our use of
-// promiscuous mode).
+// DeliverLoopback delivers pkt back into gVisor's network stack as if it
+// arrived from the network, for self-addressed (loopback) packets. It takes
+// ownership of one reference count on pkt. The caller must not use pkt after
+// calling this method. It returns false if the dispatcher is not attached.
 //
-// The caller transfers one ref to this function; we DecRef it on return.
-func (ep *linkEndpoint) injectInboundPacketBuffer(outboundPkt *stack.PacketBuffer) {
-	defer outboundPkt.DecRef()
-
+// Outbound packets from gVisor have their headers already parsed into separate
+// views (NetworkHeader, TransportHeader, Data). DeliverNetworkPacket expects
+// a raw unparsed packet, so we must re-serialize the packet into a new
+// PacketBuffer with all bytes in the payload for gVisor to parse on inbound.
+func (ep *linkEndpoint) DeliverLoopback(pkt *stack.PacketBuffer) bool {
 	ep.mu.RLock()
 	d := ep.dispatcher
 	ep.mu.RUnlock()
-	if d == nil || !buildfeatures.HasNetstack {
-		return
+	if d == nil {
+		pkt.DecRef()
+		return false
 	}
 
-	payload := stack.PayloadSince(outboundPkt.NetworkHeader())
-	if payload == nil {
-		return
-	}
-	defer payload.Release()
+	// Serialize the outbound packet back to raw bytes.
+	raw := stack.PayloadSince(pkt.NetworkHeader()).AsSlice()
+	proto := pkt.NetworkProtocolNumber
 
-	inboundPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload: buffer.MakeWithData(bytes.Clone(payload.AsSlice())),
+	// We're done with the original outbound packet.
+	pkt.DecRef()
+
+	// Create a new PacketBuffer from the raw bytes for inbound delivery.
+	newPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData(raw),
 	})
-	inboundPkt.NetworkProtocolNumber = outboundPkt.NetworkProtocolNumber
-	inboundPkt.RXChecksumValidated = true
-	defer inboundPkt.DecRef()
+	newPkt.NetworkProtocolNumber = proto
+	newPkt.RXChecksumValidated = true
 
-	d.DeliverNetworkPacket(inboundPkt.NetworkProtocolNumber, inboundPkt)
+	d.DeliverNetworkPacket(proto, newPkt)
+	newPkt.DecRef()
+	return true
 }
 
 // Attach saves the stack network-layer dispatcher for use later when packets

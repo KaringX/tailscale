@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package store provides various implementation of ipn.StateStore.
@@ -214,7 +214,11 @@ func (s *FileStore) WriteState(id ipn.StateKey, bs []byte) error {
 	if bytes.Equal(s.cache[id], bs) {
 		return nil
 	}
-	s.cache[id] = bytes.Clone(bs)
+	if bs == nil {
+		delete(s.cache, id)
+	} else {
+		s.cache[id] = bytes.Clone(bs)
+	}
 	bs, err := json.MarshalIndent(s.cache, "", "  ")
 	if err != nil {
 		return err

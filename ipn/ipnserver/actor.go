@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipnserver
@@ -145,7 +145,7 @@ func (a *actor) Username() (string, error) {
 		}
 		defer tok.Close()
 		return tok.Username()
-	case "darwin", "linux", "illumos", "solaris", "openbsd":
+	case "darwin", "linux", "illumos", "solaris", "openbsd", "freebsd":
 		creds := a.ci.Creds()
 		if creds == nil {
 			return "", errors.New("peer credentials not implemented on this OS")
@@ -237,7 +237,7 @@ func connIsLocalAdmin(logf logger.Logf, ci *ipnauth.ConnIdentity, operatorUID st
 		// This is a standalone tailscaled setup, use the same logic as on
 		// Linux.
 		fallthrough
-	case "linux":
+	case "linux", "solaris", "illumos":
 		if !buildfeatures.HasUnixSocketIdentity {
 			// Everybody is an admin if support for unix socket identities
 			// is omitted for the build.

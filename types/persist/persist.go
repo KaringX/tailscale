@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package persist contains the Persist type.
@@ -29,7 +29,7 @@ type Persist struct {
 	AttestationKey    key.HardwareAttestationKey `json:",omitzero"`
 
 	// DisallowedTKAStateIDs stores the tka.State.StateID values which
-	// this node will not operate network lock on. This is used to
+	// this node will not operate tailnet lock on. This is used to
 	// prevent bootstrapping TKA onto a key authority which was forcibly
 	// disabled.
 	DisallowedTKAStateIDs []string `json:",omitempty"`

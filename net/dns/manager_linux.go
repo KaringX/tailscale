@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux && !android
@@ -21,6 +21,7 @@ import (
 	"github.com/sagernet/tailscale/net/netaddr"
 	"github.com/sagernet/tailscale/types/logger"
 	"github.com/sagernet/tailscale/util/clientmetric"
+	"github.com/sagernet/tailscale/util/eventbus"
 	"github.com/sagernet/tailscale/util/syspolicy/policyclient"
 	"github.com/sagernet/tailscale/version/distro"
 )
@@ -63,7 +64,7 @@ var (
 // NewOSConfigurator created a new OS configurator.
 //
 // The health tracker may be nil; the knobs may be nil and are ignored on this platform.
-func NewOSConfigurator(logf logger.Logf, health *health.Tracker, _ policyclient.Client, _ *controlknobs.Knobs, interfaceName string) (ret OSConfigurator, err error) {
+func NewOSConfigurator(logf logger.Logf, health *health.Tracker, bus *eventbus.Bus, _ policyclient.Client, _ *controlknobs.Knobs, interfaceName string) (ret OSConfigurator, err error) {
 	if !buildfeatures.HasDNS || distro.Get() == distro.JetKVM {
 		return NewNoopManager()
 	}
@@ -100,7 +101,7 @@ func NewOSConfigurator(logf logger.Logf, health *health.Tracker, _ policyclient.
 	logf("dns: using %q mode", mode)
 	switch mode {
 	case "direct":
-		return newDirectManagerOnFS(logf, health, env.fs), nil
+		return newDirectManagerOnFS(logf, health, bus, env.fs), nil
 	case "systemd-resolved":
 		if f, ok := optNewResolvedManager.GetOk(); ok {
 			return f(logf, health, interfaceName)
@@ -119,7 +120,7 @@ func NewOSConfigurator(logf logger.Logf, health *health.Tracker, _ policyclient.
 		logf("[unexpected] detected unknown DNS mode %q, using direct manager as last resort", mode)
 	}
 
-	return newDirectManagerOnFS(logf, health, env.fs), nil
+	return newDirectManagerOnFS(logf, health, bus, env.fs), nil
 }
 
 // newOSConfigEnv are the funcs newOSConfigurator needs, pulled out for testing.
@@ -379,7 +380,7 @@ func isLibnssResolveUsed(env newOSConfigEnv) error {
 	if err != nil {
 		return fmt.Errorf("reading /etc/resolv.conf: %w", err)
 	}
-	for _, line := range strings.Split(string(bs), "\n") {
+	for line := range strings.SplitSeq(string(bs), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 2 || fields[0] != "hosts:" {
 			continue

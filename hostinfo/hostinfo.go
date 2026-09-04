@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package hostinfo answers questions about the host environment that Tailscale is
@@ -22,7 +22,7 @@ import (
 	"github.com/sagernet/tailscale/tailcfg"
 	"github.com/sagernet/tailscale/types/lazy"
 	"github.com/sagernet/tailscale/types/opt"
-	"github.com/sagernet/tailscale/types/ptr"
+	opt2 "github.com/sagernet/tailscale/types/opt"
 	"github.com/sagernet/tailscale/util/cloudenv"
 	"github.com/sagernet/tailscale/util/dnsname"
 	"github.com/sagernet/tailscale/util/lineiter"
@@ -93,8 +93,8 @@ func condCall[T any](fn func() T) T {
 }
 
 var (
-	lazyInContainer = &lazyAtomicValue[opt.Bool]{f: ptr.To(inContainer)}
-	lazyGoArchVar   = &lazyAtomicValue[string]{f: ptr.To(goArchVar)}
+	lazyInContainer = &lazyAtomicValue[opt.Bool]{f: func() *func() opt2.Bool { godownValue := inContainer; return &godownValue }()}
+	lazyGoArchVar   = &lazyAtomicValue[string]{f: func() *func() string { godownValue := goArchVar; return &godownValue }()}
 )
 
 type lazyAtomicValue[T any] struct {

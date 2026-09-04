@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package httphdr implements functionality for parsing and formatting
@@ -44,7 +44,7 @@ func ParseRange(hdr string) (ranges []Range, ok bool) {
 	hdr = strings.Trim(hdr, ows) // per RFC 7230, section 3.2
 	units, elems, hasUnits := strings.Cut(hdr, "=")
 	elems = strings.TrimLeft(elems, ","+ows)
-	for _, elem := range strings.Split(elems, ",") {
+	for elem := range strings.SplitSeq(elems, ",") {
 		elem = strings.Trim(elem, ows) // per RFC 7230, section 7
 		switch {
 		case strings.HasPrefix(elem, "-"): // i.e., "-" suffix-length

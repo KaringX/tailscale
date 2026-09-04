@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package geo
@@ -125,6 +125,9 @@ func (p Point) SphericalAngleTo(q Point) (Radians, error) {
 	sLat, sLng := float64(qLat.Radians()), float64(qLng.Radians())
 	cosA := math.Sin(rLat)*math.Sin(sLat) +
 		math.Cos(rLat)*math.Cos(sLat)*math.Cos(rLng-sLng)
+	// Subtle floating point imprecision can lead to cosA being outside
+	// the domain of arccosine [-1, 1]. Clamp the input to avoid NaN return.
+	cosA = min(max(-1.0, cosA), 1.0)
 	return Radians(math.Acos(cosA)), nil
 }
 
@@ -163,7 +166,7 @@ func (p Point) AppendBinary(b []byte) ([]byte, error) {
 	return b, nil
 }
 
-// MarshalBinary implements [encoding.BinaryMarshaller]. The output matches that
+// MarshalBinary implements [encoding.BinaryMarshaler]. The output matches that
 // of calling [Point.AppendBinary].
 func (p Point) MarshalBinary() ([]byte, error) {
 	var b [8]byte
@@ -220,23 +223,41 @@ func (p Point) AppendText(b []byte) ([]byte, error) {
 	return b, nil
 }
 
-// MarshalText implements [encoding.TextMarshaller]. The output matches that
+// MarshalText implements [encoding.TextMarshaler]. The output matches that
 // of calling [Point.AppendText].
 func (p Point) MarshalText() ([]byte, error) {
 	var b [8]byte
 	return p.AppendText(b[:0])
 }
 
-// MarshalUint64 produces the same output as MashalBinary, encoded in a uint64.
-func (p Point) MarshalUint64() (uint64, error) {
+// MarshalScalar implements [encoding.ScalarMarshaler].
+// It produces the same output as MashalBinary, encoded in a uint64.
+func (p Point) MarshalScalar() (uint64, error) {
 	b, err := p.MarshalBinary()
 	return binary.NativeEndian.Uint64(b), err
 }
 
-// UnmarshalUint64 expects input formatted by MarshalUint64.
-func (p *Point) UnmarshalUint64(v uint64) error {
+// UnmarshalScalar implements [encoding.ScalarUnmarshaler].
+// It expects input formatted by MarshalScalar.
+func (p *Point) UnmarshalScalar(v uint64) error {
 	b := binary.NativeEndian.AppendUint64(nil, v)
 	return p.UnmarshalBinary(b)
+}
+
+// MarshalUint64 produces the same output as MashalBinary, encoded in a uint64.
+// Deprecated: this function simply calls [Point.MarshalScalar].
+//
+//go:fix inline
+func (p Point) MarshalUint64() (uint64, error) {
+	return p.MarshalScalar()
+}
+
+// UnmarshalUint64 expects input formatted by MarshalUint64.
+// Deprecated: this function simply calls [Point.UnmarshalScalar].
+//
+//go:fix inline
+func (p *Point) UnmarshalUint64(v uint64) error {
+	return p.UnmarshalScalar(v)
 }
 
 // IsZero reports if p is the zero value.

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package mkversion gets version info from git and provides a bunch of
@@ -289,7 +289,7 @@ func mkOutput(v verInfo) (VersionInfo, error) {
 		// We started to need to do this in 2023, and the last Apple-generated
 		// incrementing build number was 273. To avoid using up the space, we
 		// use <year - 1750> as the major version (thus 273.*, 274.* in 2024, etc.),
-		// so that we we're still in the same range. This way if Apple goes back to
+		// so that we're still in the same range. This way if Apple goes back to
 		// auto-incrementing the number for us, we can go back to it with
 		// reasonable-looking numbers.
 		// In May 2024, a build with version number 275 was uploaded to the App Store
@@ -384,7 +384,7 @@ func infoFromCache(ref string, runner dirRunner) (verInfo, error) {
 	}
 	changeCount, err := strconv.Atoi(s)
 	if err != nil {
-		return verInfo{}, fmt.Errorf("infoFromCache: parsing changeCount %q: %w", changeCount, err)
+		return verInfo{}, fmt.Errorf("infoFromCache: parsing changeCount %q: %w", s, err)
 	}
 
 	return verInfo{

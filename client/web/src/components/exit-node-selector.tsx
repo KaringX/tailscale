@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 import cx from "classnames"
@@ -61,7 +61,7 @@ export default function ExitNodeSelector({
     none, // not using exit nodes
     advertising, // advertising as exit node
     using, // using another exit node
-    offline, // selected exit node node is offline
+    offline, // selected exit node is offline
   ] = useMemo(
     () => [
       selected.ID === noExitNode.ID,

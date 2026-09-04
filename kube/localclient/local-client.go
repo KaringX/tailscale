@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package localclient provides an interface for all the local.Client methods
@@ -17,6 +17,9 @@ import (
 // for easier testing.
 type LocalClient interface {
 	WatchIPNBus(ctx context.Context, mask ipn.NotifyWatchOpt) (IPNBusWatcher, error)
+	SetServeConfig(context.Context, *ipn.ServeConfig) error
+	EditPrefs(ctx context.Context, mp *ipn.MaskedPrefs) (*ipn.Prefs, error)
+	CertDomains(ctx context.Context) ([]string, error)
 	CertIssuer
 }
 
@@ -40,10 +43,22 @@ type localClient struct {
 	lc *local.Client
 }
 
+func (lc *localClient) SetServeConfig(ctx context.Context, config *ipn.ServeConfig) error {
+	return lc.lc.SetServeConfig(ctx, config)
+}
+
+func (lc *localClient) EditPrefs(ctx context.Context, mp *ipn.MaskedPrefs) (*ipn.Prefs, error) {
+	return lc.lc.EditPrefs(ctx, mp)
+}
+
 func (lc *localClient) WatchIPNBus(ctx context.Context, mask ipn.NotifyWatchOpt) (IPNBusWatcher, error) {
 	return lc.lc.WatchIPNBus(ctx, mask)
 }
 
 func (lc *localClient) CertPair(ctx context.Context, domain string) ([]byte, []byte, error) {
 	return lc.lc.CertPair(ctx, domain)
+}
+
+func (lc *localClient) CertDomains(ctx context.Context) ([]string, error) {
+	return lc.lc.CertDomains(ctx)
 }

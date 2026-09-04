@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package netns contains the common code for using the Go net package
@@ -77,6 +77,18 @@ var bindToInterfaceByRoute atomic.Bool
 func SetBindToInterfaceByRoute(logf logger.Logf, v bool) {
 	if bindToInterfaceByRoute.Swap(v) != v {
 		logf("netns: bindToInterfaceByRoute changed to %v", v)
+	}
+}
+
+// When true, disableAndroidBindToActiveNetwork skips binding sockets to the currently
+// active network on Android.
+var disableAndroidBindToActiveNetwork atomic.Bool
+
+// SetDisableAndroidBindToActiveNetwork disables the default behavior of binding
+// sockets to the currently active network on Android.
+func SetDisableAndroidBindToActiveNetwork(logf logger.Logf, v bool) {
+	if runtime.GOOS == "android" && disableAndroidBindToActiveNetwork.Swap(v) != v {
+		logf("netns: disableAndroidBindToActiveNetwork changed to %v", v)
 	}
 }
 

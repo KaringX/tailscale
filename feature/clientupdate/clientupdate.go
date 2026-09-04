@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package clientupdate enables the client update feature.
@@ -36,6 +36,7 @@ import (
 )
 
 func init() {
+	feature.Register("clientupdate")
 	ipnext.RegisterExtension("clientupdate", newExt)
 
 	// C2N
@@ -162,6 +163,7 @@ func (e *extension) DoSelfUpdate() {
 	})
 	if err != nil {
 		e.pushSelfUpdateProgress(ipnstate.NewUpdateProgress(ipnstate.UpdateFailed, err.Error()))
+		return
 	}
 	err = up.Update()
 	if err != nil {

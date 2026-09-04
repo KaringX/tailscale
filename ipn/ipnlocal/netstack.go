@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !ts_omit_netstack
@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/sagernet/gvisor/pkg/tcpip"
-	"github.com/sagernet/tailscale/types/ptr"
+	tcpip2 "github.com/sagernet/gvisor/pkg/tcpip"
 )
 
 // TCPHandlerForDst returns a TCP handler for connections to dst, or nil if
@@ -52,7 +52,10 @@ func (b *LocalBackend) TCPHandlerForDst(src, dst netip.AddrPort) (handler func(c
 		// tell the difference between a long lived connection that is idle
 		// vs a connection that is dead because the peer has gone away.
 		// We pick 72h as that is typically sufficient for a long weekend.
-		opts = append(opts, ptr.To(tcpip.KeepaliveIdleOption(72*time.Hour)))
+		opts = append(opts, func() *tcpip2.KeepaliveIdleOption {
+			godownValue := tcpip.KeepaliveIdleOption(72 * time.Hour)
+			return &godownValue
+		}())
 		return b.handleSSHConn, opts
 	}
 	// TODO(will,sonia): allow customizing web client port ?

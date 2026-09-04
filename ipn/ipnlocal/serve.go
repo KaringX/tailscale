@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 //go:build !ts_omit_serve
@@ -35,6 +35,7 @@ import (
 
 	"github.com/pires/go-proxyproto"
 	"github.com/sagernet/tailscale/ipn"
+	"github.com/sagernet/tailscale/net/netmon"
 	"github.com/sagernet/tailscale/net/netutil"
 	"github.com/sagernet/tailscale/syncs"
 	"github.com/sagernet/tailscale/tailcfg"
@@ -46,6 +47,7 @@ import (
 	"github.com/sagernet/tailscale/util/ctxkey"
 	"github.com/sagernet/tailscale/util/mak"
 	"github.com/sagernet/tailscale/util/slicesx"
+	"github.com/sagernet/tailscale/util/usermetric"
 	"github.com/sagernet/tailscale/version"
 	"go4.org/mem"
 )
@@ -75,6 +77,10 @@ const (
 // If-Match header does not match with the
 // current etag of a resource.
 var ErrETagMismatch = errors.New("etag mismatch")
+
+// ErrProxyToTailscaledSocket is returned when attempting to proxy
+// to the tailscaled socket itself, which would create a loop.
+var ErrProxyToTailscaledSocket = errors.New("cannot proxy to tailscaled socket")
 
 var serveHTTPContextKey ctxkey.Key[*serveHTTPContext]
 
@@ -161,16 +167,24 @@ func (s *localListener) Run() {
 
 		var lc net.ListenConfig
 		if initListenConfig != nil {
+			ifIndex, err := netmon.TailscaleInterfaceIndex()
+			if err != nil {
+				s.logf("localListener failed to get Tailscale interface index %v, backing off: %v", s.ap, err)
+				s.bo.BackOff(s.ctx, err)
+				continue
+			}
+
 			// On macOS, this sets the lc.Control hook to
 			// setsockopt the interface index to bind to. This is
-			// required by the network sandbox to allow binding to
-			// a specific interface. Without this hook, the system
-			// chooses a default interface to bind to.
-			if err := initListenConfig(&lc, ip, s.b.prevIfState, s.b.dialer.TUNName()); err != nil {
+			// required by the network sandbox which will not automatically
+			// bind to the tailscale interface to prevent routing loops.
+			// Explicit binding allows us to bypass that restriction.
+			if err := initListenConfig(&lc, ip, ifIndex); err != nil {
 				s.logf("localListener failed to init listen config %v, backing off: %v", s.ap, err)
 				s.bo.BackOff(s.ctx, err)
 				continue
 			}
+
 			// On macOS (AppStore or macsys) and if we're binding to a privileged port,
 			if version.IsSandboxedMacOS() && s.ap.Port() < 1024 {
 				// On macOS, we need to bind to ""/all-interfaces due to
@@ -262,7 +276,7 @@ func (b *LocalBackend) updateServeTCPPortNetMapAddrListenersLocked(ports []uint1
 		}
 	}
 
-	nm := b.NetMap()
+	nm := b.NetMapNoPeers()
 	if nm == nil {
 		b.logf("netMap is nil")
 		return
@@ -288,6 +302,15 @@ func (b *LocalBackend) updateServeTCPPortNetMapAddrListenersLocked(ports []uint1
 	}
 }
 
+func generateServeConfigETag(sc ipn.ServeConfigView) (string, error) {
+	j, err := json.Marshal(sc)
+	if err != nil {
+		return "", fmt.Errorf("encoding config: %w", err)
+	}
+	sum := sha256.Sum256(j)
+	return hex.EncodeToString(sum[:]), nil
+}
+
 // SetServeConfig establishes or replaces the current serve config.
 // ETag is an optional parameter to enforce Optimistic Concurrency Control.
 // If it is an empty string, then the config will be overwritten.
@@ -310,7 +333,7 @@ func (b *LocalBackend) setServeConfigLocked(config *ipn.ServeConfig, etag string
 		return errors.New("can't reconfigure tailscaled when using a config file; config file is locked")
 	}
 
-	nm := b.NetMap()
+	nm := b.NetMapNoPeers()
 	if nm == nil {
 		return errors.New("netMap is nil")
 	}
@@ -322,17 +345,11 @@ func (b *LocalBackend) setServeConfigLocked(config *ipn.ServeConfig, etag string
 	// not changed from the last config.
 	prevConfig := b.serveConfig
 	if etag != "" {
-		// Note that we marshal b.serveConfig
-		// and not use b.lastServeConfJSON as that might
-		// be a Go nil value, which produces a different
-		// checksum from a JSON "null" value.
-		prevBytes, err := json.Marshal(prevConfig)
+		prevETag, err := generateServeConfigETag(prevConfig)
 		if err != nil {
-			return fmt.Errorf("error encoding previous config: %w", err)
+			return fmt.Errorf("generating ETag for previous config: %w", err)
 		}
-		sum := sha256.Sum256(prevBytes)
-		previousEtag := hex.EncodeToString(sum[:])
-		if etag != previousEtag {
+		if etag != prevETag {
 			return ErrETagMismatch
 		}
 	}
@@ -385,6 +402,20 @@ func (b *LocalBackend) ServeConfig() ipn.ServeConfigView {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.serveConfig
+}
+
+// ServeConfigETag provides a view of the current serve mappings and an ETag,
+// which can later be provided to [LocalBackend.SetServeConfig] to implement
+// Optimistic Concurrency Control.
+//
+// If serving is not configured, the returned view is not Valid.
+func (b *LocalBackend) ServeConfigETag() (scv ipn.ServeConfigView, etag string, err error) {
+	sc := b.ServeConfig()
+	etag, err = generateServeConfigETag(sc)
+	if err != nil {
+		return ipn.ServeConfigView{}, "", fmt.Errorf("generating ETag: %w", err)
+	}
+	return sc, etag, nil
 }
 
 // DeleteForegroundSession deletes a ServeConfig's foreground session
@@ -503,6 +534,56 @@ func (b *LocalBackend) vipServicesFromPrefsLocked(prefs ipn.PrefsView) []*tailcf
 	return servicesList
 }
 
+type serviceMeteredConn struct {
+	net.Conn
+	inbound, outbound *usermetric.MultiLabelMap[serveLabels]
+	key               serveLabels
+}
+
+func (c *serviceMeteredConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.inbound.Add(c.key, int64(n))
+	}
+	return n, err
+}
+
+func (c *serviceMeteredConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.outbound.Add(c.key, int64(n))
+	}
+	return n, err
+}
+
+// CloseWrite forwards a write-half close to the underlying conn. We only embed
+// the net.Conn interface, which would otherwise hide the underlying conn's
+// CloseWrite; net/http's server relies on it (closeWriteAndWait) to send a FIN
+// and drain gracefully when a connection won't be reused, avoiding a truncating
+// RST on the final response.
+func (c *serviceMeteredConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+// meteredConnForService wraps c to count peer bytes against the per-Service
+// Serve counters. The per-Service series is never evicted, so it leaks
+// (intentionally) until tailscaled exits.
+func (b *LocalBackend) meteredConnForService(c net.Conn, svc tailcfg.ServiceName) net.Conn {
+	// Plain (non-Service) serve passes an empty svc; don't meter it.
+	if svc == "" || b.metrics.serveBytesInbound == nil || b.metrics.serveBytesOutbound == nil {
+		return c
+	}
+	return &serviceMeteredConn{
+		Conn:     c,
+		inbound:  b.metrics.serveBytesInbound,
+		outbound: b.metrics.serveBytesOutbound,
+		key:      serveLabels{Service: svc.String()},
+	}
+}
+
 // tcpHandlerForVIPService returns a handler for a TCP connection to a VIP service
 // that is being served via the ipn.ServeConfig. It returns nil if the destination
 // address is not a VIP service or if the VIP service does not have a TCP handler set.
@@ -529,77 +610,14 @@ func (b *LocalBackend) tcpHandlerForVIPService(dstAddr, srcAddr netip.AddrPort) 
 		return nil
 	}
 
-	if tcph.HTTPS() || tcph.HTTP() {
-		hs := &http.Server{
-			Handler: http.HandlerFunc(b.serveWebHandler),
-			BaseContext: func(_ net.Listener) context.Context {
-				return serveHTTPContextKey.WithValue(context.Background(), &serveHTTPContext{
-					SrcAddr:       srcAddr,
-					ForVIPService: dstSvc,
-					DestPort:      dport,
-				})
-			},
-		}
-		if tcph.HTTPS() {
-			// TODO(kevinliang10): just leaving this TLS cert creation as if we don't have other
-			// hostnames, but for services this getTLSServeCetForPort will need a version that also take
-			// in the hostname. How to store the TLS cert is still being discussed.
-			hs.TLSConfig = &tls.Config{
-				GetCertificate: b.getTLSServeCertForPort(dport, dstSvc),
-			}
-			return func(c net.Conn) error {
-				return hs.ServeTLS(netutil.NewOneConnListener(c, nil), "", "")
-			}
-		}
-
-		return func(c net.Conn) error {
-			return hs.Serve(netutil.NewOneConnListener(c, nil))
-		}
-	}
-
-	if backDst := tcph.TCPForward(); backDst != "" {
-		return func(conn net.Conn) error {
-			defer conn.Close()
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			backConn, err := b.dialer.SystemDial(ctx, "tcp", backDst)
-			cancel()
-			if err != nil {
-				b.logf("localbackend: failed to TCP proxy port %v (from %v) to %s: %v", dport, srcAddr, backDst, err)
-				return nil
-			}
-			defer backConn.Close()
-			if sni := tcph.TerminateTLS(); sni != "" {
-				conn = tls.Server(conn, &tls.Config{
-					GetCertificate: func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
-						ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-						defer cancel()
-						pair, err := b.GetCertPEM(ctx, sni)
-						if err != nil {
-							return nil, err
-						}
-						cert, err := tls.X509KeyPair(pair.CertPEM, pair.KeyPEM)
-						if err != nil {
-							return nil, err
-						}
-						return &cert, nil
-					},
-				})
-			}
-
-			errc := make(chan error, 1)
-			go func() {
-				_, err := io.Copy(backConn, conn)
-				errc <- err
-			}()
-			go func() {
-				_, err := io.Copy(conn, backConn)
-				errc <- err
-			}()
-			return <-errc
-		}
-	}
-
-	return nil
+	// TODO(kevinliang10): just leaving this TLS cert creation as if we don't have other
+	// hostnames, but for services this getTLSServeCetForPort will need a version that also take
+	// in the hostname. How to store the TLS cert is still being discussed.
+	return b.tcpHandlerForServeTCP(tcph, dport, srcAddr, &serveHTTPContext{
+		SrcAddr:       srcAddr,
+		ForVIPService: dstSvc,
+		DestPort:      dport,
+	}, dstSvc)
 }
 
 // tcpHandlerForServe returns a handler for a TCP connection to be served via
@@ -619,27 +637,32 @@ func (b *LocalBackend) tcpHandlerForServe(dport uint16, srcAddr netip.AddrPort, 
 		return nil
 	}
 
+	return b.tcpHandlerForServeTCP(tcph, dport, srcAddr, &serveHTTPContext{
+		Funnel:   f,
+		SrcAddr:  srcAddr,
+		DestPort: dport,
+	}, "")
+}
+
+func (b *LocalBackend) tcpHandlerForServeTCP(tcph ipn.TCPPortHandlerView, dport uint16, srcAddr netip.AddrPort, httpCtx *serveHTTPContext, forVIPService tailcfg.ServiceName) func(net.Conn) error {
 	if tcph.HTTPS() || tcph.HTTP() {
 		hs := &http.Server{
 			Handler: http.HandlerFunc(b.serveWebHandler),
 			BaseContext: func(_ net.Listener) context.Context {
-				return serveHTTPContextKey.WithValue(context.Background(), &serveHTTPContext{
-					Funnel:   f,
-					SrcAddr:  srcAddr,
-					DestPort: dport,
-				})
+				c := *httpCtx
+				return serveHTTPContextKey.WithValue(context.Background(), &c)
 			},
 		}
 		if tcph.HTTPS() {
-			hs.TLSConfig = &tls.Config{
-				GetCertificate: b.getTLSServeCertForPort(dport, ""),
-			}
+			hs.TLSConfig = b.serveTLSConfig(b.getTLSServeCertForPort(dport, forVIPService), serveTLSNextProtos())
 			return func(c net.Conn) error {
+				c = b.meteredConnForService(c, forVIPService)
 				return hs.ServeTLS(netutil.NewOneConnListener(c, nil), "", "")
 			}
 		}
 
 		return func(c net.Conn) error {
+			c = b.meteredConnForService(c, forVIPService)
 			return hs.Serve(netutil.NewOneConnListener(c, nil))
 		}
 	}
@@ -647,8 +670,16 @@ func (b *LocalBackend) tcpHandlerForServe(dport uint16, srcAddr netip.AddrPort, 
 	if backDst := tcph.TCPForward(); backDst != "" {
 		return func(conn net.Conn) error {
 			defer conn.Close()
+			conn = b.meteredConnForService(conn, forVIPService)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			backConn, err := b.dialer.SystemDial(ctx, "tcp", backDst)
+			var backConn net.Conn
+			var err error
+			if socketPath, ok := strings.CutPrefix(backDst, "unix:"); ok {
+				var d net.Dialer
+				backConn, err = d.DialContext(ctx, "unix", socketPath)
+			} else {
+				backConn, err = b.dialer.SystemDial(ctx, "tcp", backDst)
+			}
 			cancel()
 			if err != nil {
 				b.logf("localbackend: failed to TCP proxy port %v (from %v) to %s: %v", dport, srcAddr, backDst, err)
@@ -656,110 +687,117 @@ func (b *LocalBackend) tcpHandlerForServe(dport uint16, srcAddr netip.AddrPort, 
 			}
 			defer backConn.Close()
 			if sni := tcph.TerminateTLS(); sni != "" {
-				conn = tls.Server(conn, &tls.Config{
-					GetCertificate: func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
-						ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-						defer cancel()
-						pair, err := b.GetCertPEM(ctx, sni)
-						if err != nil {
-							return nil, err
-						}
-						cert, err := tls.X509KeyPair(pair.CertPEM, pair.KeyPEM)
-						if err != nil {
-							return nil, err
-						}
-						return &cert, nil
-					},
-				})
-			}
-
-			var proxyHeader []byte
-			if ver := tcph.ProxyProtocol(); ver > 0 {
-				// backAddr is the final "destination" of the connection,
-				// which is the connection to the proxied-to backend.
-				backAddr := backConn.RemoteAddr().(*net.TCPAddr)
-
-				// We always want to format the PROXY protocol
-				// header based on the IPv4 or IPv6-ness of
-				// the client. The SourceAddr and
-				// DestinationAddr need to match in type, so we
-				// need to be careful to not e.g. set a
-				// SourceAddr of type IPv6 and DestinationAddr
-				// of type IPv4.
-				//
-				// If this is an IPv6-mapped IPv4 address,
-				// though, unmap it.
-				proxySrcAddr := srcAddr
-				if proxySrcAddr.Addr().Is4In6() {
-					proxySrcAddr = netip.AddrPortFrom(
-						proxySrcAddr.Addr().Unmap(),
-						proxySrcAddr.Port(),
-					)
-				}
-
-				is4 := proxySrcAddr.Addr().Is4()
-
-				var destAddr netip.Addr
-				if self := b.currentNode().Self(); self.Valid() {
-					if is4 {
-						destAddr = nodeIP(self, netip.Addr.Is4)
-					} else {
-						destAddr = nodeIP(self, netip.Addr.Is6)
+				conn = tls.Server(conn, b.serveTLSConfig(func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+					if cert, ok := b.getACMETLSALPNCert(hi); ok {
+						return cert, nil
 					}
-				}
-				if !destAddr.IsValid() {
-					// Pick a best-effort destination address of localhost.
-					if is4 {
-						destAddr = netip.AddrFrom4([4]byte{127, 0, 0, 1})
-					} else {
-						destAddr = netip.IPv6Loopback()
+					ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+					defer cancel()
+					pair, err := b.GetCertPEM(ctx, sni)
+					if err != nil {
+						return nil, err
 					}
-				}
-
-				header := &proxyproto.Header{
-					Version:    byte(ver),
-					Command:    proxyproto.PROXY,
-					SourceAddr: net.TCPAddrFromAddrPort(proxySrcAddr),
-					DestinationAddr: &net.TCPAddr{
-						IP:   destAddr.AsSlice(),
-						Port: backAddr.Port,
-					},
-				}
-				if is4 {
-					header.TransportProtocol = proxyproto.TCPv4
-				} else {
-					header.TransportProtocol = proxyproto.TCPv6
-				}
-				var err error
-				proxyHeader, err = header.Format()
-				if err != nil {
-					b.logf("localbackend: failed to format proxy protocol header for port %v (from %v) to %s: %v", dport, srcAddr, backDst, err)
-				}
+					cert, err := tls.X509KeyPair(pair.CertPEM, pair.KeyPEM)
+					if err != nil {
+						return nil, err
+					}
+					return &cert, nil
+				}, nil))
 			}
 
 			// TODO(bradfitz): do the RegisterIPPortIdentity and
 			// UnregisterIPPortIdentity stuff that netstack does
-			errc := make(chan error, 1)
-			go func() {
-				if len(proxyHeader) > 0 {
-					if _, err := backConn.Write(proxyHeader); err != nil {
-						errc <- err
-						backConn.Close() // to ensure that the other side gets EOF
-						return
-					}
-				}
-				_, err := io.Copy(backConn, conn)
-				errc <- err
-			}()
-			go func() {
-				_, err := io.Copy(conn, backConn)
-				errc <- err
-			}()
-			return <-errc
+			return b.forwardTCPWithProxyProtocol(conn, backConn, tcph.ProxyProtocol(), srcAddr, dport, backDst)
 		}
 	}
 
 	return nil
+}
+
+// forwardTCPWithProxyProtocol forwards TCP traffic between conn and backConn,
+// optionally prepending a PROXY protocol header if proxyProtoVer > 0.
+// The srcAddr is the original client address used to build the PROXY header.
+func (b *LocalBackend) forwardTCPWithProxyProtocol(conn, backConn net.Conn, proxyProtoVer int, srcAddr netip.AddrPort, dport uint16, backDst string) error {
+	var proxyHeader []byte
+	if proxyProtoVer > 0 {
+		// PROXY protocol requires a valid TCP destination address.
+		// For Unix socket backends, RemoteAddr is *net.UnixAddr;
+		// the CLI rejects this combination, but guard here as well.
+		backAddr, ok := backConn.RemoteAddr().(*net.TCPAddr)
+		if !ok {
+			return fmt.Errorf("PROXY protocol is not supported with non-TCP backend %s", backDst)
+		}
+
+		// We always want to format the PROXY protocol header based on
+		// the IPv4 or IPv6-ness of the client. The SourceAddr and
+		// DestinationAddr need to match in type.
+		// If this is an IPv6-mapped IPv4 address, unmap it.
+		proxySrcAddr := srcAddr
+		if proxySrcAddr.Addr().Is4In6() {
+			proxySrcAddr = netip.AddrPortFrom(
+				proxySrcAddr.Addr().Unmap(),
+				proxySrcAddr.Port(),
+			)
+		}
+
+		is4 := proxySrcAddr.Addr().Is4()
+
+		var destAddr netip.Addr
+		if self := b.currentNode().Self(); self.Valid() {
+			if is4 {
+				destAddr = nodeIP(self, netip.Addr.Is4)
+			} else {
+				destAddr = nodeIP(self, netip.Addr.Is6)
+			}
+		}
+		if !destAddr.IsValid() {
+			// Unexpected: we couldn't determine the node's IP address.
+			// Pick a best-effort destination address of localhost.
+			if is4 {
+				destAddr = netip.AddrFrom4([4]byte{127, 0, 0, 1})
+			} else {
+				destAddr = netip.IPv6Loopback()
+			}
+		}
+
+		header := &proxyproto.Header{
+			Version:    byte(proxyProtoVer),
+			Command:    proxyproto.PROXY,
+			SourceAddr: net.TCPAddrFromAddrPort(proxySrcAddr),
+			DestinationAddr: &net.TCPAddr{
+				IP:   destAddr.AsSlice(),
+				Port: backAddr.Port,
+			},
+		}
+		if is4 {
+			header.TransportProtocol = proxyproto.TCPv4
+		} else {
+			header.TransportProtocol = proxyproto.TCPv6
+		}
+		var err error
+		proxyHeader, err = header.Format()
+		if err != nil {
+			b.logf("localbackend: failed to format proxy protocol header for port %v (from %v) to %s: %v", dport, srcAddr, backDst, err)
+		}
+	}
+
+	errc := make(chan error, 1)
+	go func() {
+		if len(proxyHeader) > 0 {
+			if _, err := backConn.Write(proxyHeader); err != nil {
+				errc <- err
+				backConn.Close()
+				return
+			}
+		}
+		_, err := io.Copy(backConn, conn)
+		errc <- err
+	}()
+	go func() {
+		_, err := io.Copy(conn, backConn)
+		errc <- err
+	}()
+	return <-errc
 }
 
 func (b *LocalBackend) getServeHandler(r *http.Request) (_ ipn.HTTPHandlerView, at string, ok bool) {
@@ -792,6 +830,15 @@ func (b *LocalBackend) getServeHandler(r *http.Request) (_ ipn.HTTPHandlerView, 
 		return h, r.URL.Path, true
 	}
 	pth := path.Clean(r.URL.Path)
+	// A well-formed origin-form request path is absolute. Malformed request
+	// targets — "*" (e.g. "GET *") and "" (e.g. "CONNECT" authority-form),
+	// clean to "*" and "." respectively. Those are path.Dir fixed points that
+	// never equal "/" and match no mount, so without this guard the loop below
+	// would spin forever on one CPU core (a remote DoS via serve, or via funnel
+	// from the internet).
+	if !strings.HasPrefix(pth, "/") {
+		return z, "", false
+	}
 	for {
 		withSlash := pth + "/"
 		if h, ok := wsc.Handlers().GetOk(withSlash); ok {
@@ -803,7 +850,13 @@ func (b *LocalBackend) getServeHandler(r *http.Request) (_ ipn.HTTPHandlerView, 
 		if pth == "/" {
 			return z, "", false
 		}
-		pth = path.Dir(pth)
+		// Belt-and-suspenders with the absolute-path check above: stop if
+		// path.Dir stops shrinking rather than assuming it always reaches "/".
+		if parent := path.Dir(pth); parent != pth {
+			pth = parent
+		} else {
+			return z, "", false
+		}
 	}
 }
 
@@ -811,6 +864,27 @@ func (b *LocalBackend) getServeHandler(r *http.Request) (_ ipn.HTTPHandlerView, 
 // we serve requests for. `backend` is a HTTPHandler.Proxy string (url, hostport or just port).
 func (b *LocalBackend) proxyHandlerForBackend(backend string) (http.Handler, error) {
 	targetURL, insecure := expandProxyArg(backend)
+
+	// Handle unix: scheme specially
+	if after, ok := strings.CutPrefix(targetURL, "unix:"); ok {
+		socketPath := after
+		if socketPath == "" {
+			return nil, fmt.Errorf("empty unix socket path")
+		}
+		if b.isTailscaledSocket(socketPath) {
+			return nil, ErrProxyToTailscaledSocket
+		}
+		u, _ := url.Parse("http://localhost")
+		return &reverseProxy{
+			logf:       b.logf,
+			url:        u,
+			insecure:   false,
+			backend:    backend,
+			lb:         b,
+			socketPath: socketPath,
+		}, nil
+	}
+
 	u, err := url.Parse(targetURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid url %s: %w", targetURL, err)
@@ -823,6 +897,22 @@ func (b *LocalBackend) proxyHandlerForBackend(backend string) (http.Handler, err
 		lb:       b,
 	}
 	return p, nil
+}
+
+// isTailscaledSocket reports whether socketPath refers to the same file
+// as the tailscaled socket. It uses os.SameFile to handle symlinks,
+// bind mounts, and other path variations.
+func (b *LocalBackend) isTailscaledSocket(socketPath string) bool {
+	tailscaledSocket := b.sys.SocketPath
+	if tailscaledSocket == "" {
+		return false
+	}
+	fi1, err1 := os.Stat(socketPath)
+	fi2, err2 := os.Stat(tailscaledSocket)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return os.SameFile(fi1, fi2)
 }
 
 // reverseProxy is a proxy that forwards a request to a backend host
@@ -839,6 +929,7 @@ type reverseProxy struct {
 	insecure      bool
 	backend       string
 	lb            *LocalBackend
+	socketPath    string                          // path to unix socket, empty for TCP
 	httpTransport lazy.SyncValue[*http.Transport] // transport for non-h2c backends
 	h2cTransport  lazy.SyncValue[*http.Transport] // transport for h2c backends
 	// closed tracks whether proxy is closed/currently closing.
@@ -879,7 +970,12 @@ func (rp *reverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			r.Out.URL.RawPath = rp.url.RawPath
 		}
 
-		r.Out.Host = r.In.Host
+		// For Unix sockets, use the URL's host (localhost) instead of the incoming host
+		if rp.socketPath != "" {
+			r.Out.Host = rp.url.Host
+		} else {
+			r.Out.Host = r.In.Host
+		}
 		addProxyForwardedHeaders(r)
 		rp.lb.addTailscaleIdentityHeaders(r)
 		if err := rp.lb.addAppCapabilitiesHeader(r); err != nil {
@@ -904,8 +1000,16 @@ func (rp *reverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // to the backend. The Transport gets created lazily, at most once.
 func (rp *reverseProxy) getTransport() *http.Transport {
 	return rp.httpTransport.Get(func() *http.Transport {
+		dial := rp.lb.dialer.SystemDial
+		if rp.socketPath != "" {
+			dial = func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", rp.socketPath)
+			}
+		}
+
 		return &http.Transport{
-			DialContext: rp.lb.dialer.SystemDial,
+			DialContext: dial,
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: rp.insecure,
 			},
@@ -928,6 +1032,10 @@ func (rp *reverseProxy) getH2CTransport() http.RoundTripper {
 		tr := &http.Transport{
 			Protocols: &p,
 			DialTLSContext: func(ctx context.Context, network string, addr string) (net.Conn, error) {
+				if rp.socketPath != "" {
+					var d net.Dialer
+					return d.DialContext(ctx, "unix", rp.socketPath)
+				}
 				return rp.lb.dialer.SystemDial(ctx, "tcp", rp.url.Host)
 			},
 		}
@@ -939,6 +1047,10 @@ func (rp *reverseProxy) getH2CTransport() http.RoundTripper {
 // for a h2c server, but sufficient for our particular use case.
 func (rp *reverseProxy) shouldProxyViaH2C(r *http.Request) bool {
 	contentType := r.Header.Get(contentTypeHeader)
+	// For unix sockets, check if it's gRPC content to determine h2c
+	if rp.socketPath != "" {
+		return r.ProtoMajor == 2 && isGRPCContentType(contentType)
+	}
 	return r.ProtoMajor == 2 && strings.HasPrefix(rp.backend, "http://") && isGRPCContentType(contentType)
 }
 
@@ -1183,6 +1295,10 @@ func expandProxyArg(s string) (targetURL string, insecureSkipVerify bool) {
 	if s == "" {
 		return "", false
 	}
+	// Unix sockets - return as-is
+	if strings.HasPrefix(s, "unix:") {
+		return s, false
+	}
 	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
 		return s, false
 	}
@@ -1226,6 +1342,9 @@ func (b *LocalBackend) getTLSServeCertForPort(port uint16, forVIPService tailcfg
 		if hi == nil || hi.ServerName == "" {
 			return nil, errors.New("no SNI ServerName")
 		}
+		if cert, ok := b.getACMETLSALPNCert(hi); ok {
+			return cert, nil
+		}
 		_, ok := b.webServerConfig(hi.ServerName, forVIPService, port)
 		if !ok {
 			return nil, errors.New("no webserver configured for name/port")
@@ -1243,6 +1362,48 @@ func (b *LocalBackend) getTLSServeCertForPort(port uint16, forVIPService tailcfg
 		}
 		return &cert, nil
 	}
+}
+
+// serveTLSConfig returns the TLS configuration used by Serve and TCP-forwarded
+// TLS listeners. nextProtos is the ALPN list to advertise for normal
+// handshakes; it should be serveTLSNextProtos for HTTPS Serve and nil for
+// TLS-terminated TCP forwarding where we don't know the backend protocol.
+// During an ACME tls-alpn-01 renewal, GetConfigForClient clones the base config
+// and temporarily prepends acme-tls/1, but only for the exact SNI with a pending
+// challenge certificate. This keeps ordinary Serve traffic from advertising
+// ACME support and lets Go's TLS stack negotiate the challenge protocol before
+// GetCertificate is called.
+func (b *LocalBackend) serveTLSConfig(getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error), nextProtos []string) *tls.Config {
+	base := &tls.Config{
+		GetCertificate: getCert,
+		NextProtos:     nextProtos,
+	}
+	base.GetConfigForClient = func(hi *tls.ClientHelloInfo) (*tls.Config, error) {
+		var nextProtos []string
+		if proto, ok := b.getACMETLSALPNProto(hi); ok {
+			b.logf("serve: accepting ACME tls-alpn-01 challenge for %q", hi.ServerName)
+			nextProtos = append(nextProtos, proto)
+		}
+		if len(nextProtos) == 0 {
+			return nil, nil
+		}
+		cfg := base.Clone()
+		cfg.NextProtos = append(nextProtos, base.NextProtos...)
+		return cfg, nil
+	}
+	return base
+}
+
+// HasFunnelForHostPort reports whether the LocalBackend's serve config
+// has Funnel enabled for host:port.
+func (b *LocalBackend) HasFunnelForHostPort(host string, port uint16) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.serveConfig.Valid() {
+		return false
+	}
+	hp := ipn.HostPort(net.JoinHostPort(host, strconv.Itoa(int(port))))
+	return b.serveConfig.HasFunnelForTarget(hp)
 }
 
 // setServeProxyHandlersLocked ensures there is an http proxy handler for each
@@ -1465,6 +1626,7 @@ func (b *LocalBackend) reloadServeConfigLocked(prefs ipn.PrefsView) {
 	if err != nil {
 		b.lastServeConfJSON = mem.B(nil)
 		b.serveConfig = ipn.ServeConfigView{}
+		b.updateCertRefreshLoopLocked()
 		return
 	}
 	if b.lastServeConfJSON.Equal(mem.B(confj)) {
@@ -1475,6 +1637,7 @@ func (b *LocalBackend) reloadServeConfigLocked(prefs ipn.PrefsView) {
 	if err := json.Unmarshal(confj, &conf); err != nil {
 		b.logf("invalid ServeConfig %q in StateStore: %v", confKey, err)
 		b.serveConfig = ipn.ServeConfigView{}
+		b.updateCertRefreshLoopLocked()
 		return
 	}
 
@@ -1485,6 +1648,7 @@ func (b *LocalBackend) reloadServeConfigLocked(prefs ipn.PrefsView) {
 	})
 
 	b.serveConfig = conf.View()
+	b.updateCertRefreshLoopLocked()
 }
 
 func (b *LocalBackend) setVIPServicesTCPPortsInterceptedLocked(svcPorts map[tailcfg.ServiceName][]uint16) {

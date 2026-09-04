@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipnlocal
@@ -41,7 +41,9 @@ import (
 	"golang.org/x/net/http/httpguts"
 )
 
-var initListenConfig func(*net.ListenConfig, netip.Addr, *netmon.State, string) error
+// initListenConfig, if non-nil, is called during peerAPIListener setup.  It is used only
+// on iOS and macOS to set socket options to bind the listener to the Tailscale interface.
+var initListenConfig func(config *net.ListenConfig, addr netip.Addr, tunIfIndex int) error
 
 type PeerDNSQueryHandler interface {
 	HandlePeerDNSQuery(context.Context, []byte, netip.AddrPort, func(name string) bool) (res []byte, err error)
@@ -52,7 +54,7 @@ type peerAPIServer struct {
 	resolver PeerDNSQueryHandler
 }
 
-func (s *peerAPIServer) listen(ip netip.Addr, ifState *netmon.State) (ln net.Listener, err error) {
+func (s *peerAPIServer) listen(ip netip.Addr, tunIfIndex int) (ln net.Listener, err error) {
 	// Android for whatever reason often has problems creating the peerapi listener.
 	// But since we started intercepting it with netstack, it's not even important that
 	// we have a real kernel-level listener. So just create a dummy listener on Android
@@ -68,7 +70,14 @@ func (s *peerAPIServer) listen(ip netip.Addr, ifState *netmon.State) (ln net.Lis
 		// On iOS/macOS, this sets the lc.Control hook to
 		// setsockopt the interface index to bind to, to get
 		// out of the network sandbox.
-		if err := initListenConfig(&lc, ip, ifState, s.b.dialer.TUNName()); err != nil {
+
+		// A zero tunIfIndex is invalid for peerapi.  A zero value will not get us
+		// out of the network sandbox.  Caller should log and retry.
+		if tunIfIndex == 0 {
+			return nil, fmt.Errorf("peerapi: cannot listen on %s with tunIfIndex 0", ipStr)
+		}
+
+		if err := initListenConfig(&lc, ip, tunIfIndex); err != nil {
 			return nil, err
 		}
 		if runtime.GOOS == "darwin" || runtime.GOOS == "ios" {
@@ -93,7 +102,7 @@ func (s *peerAPIServer) listen(ip netip.Addr, ifState *netmon.State) (ln net.Lis
 	// deterministic that people will bake this into clients.
 	// We try a few times just in case something's already
 	// listening on that port (on all interfaces, probably).
-	for try := uint8(0); try < 5; try++ {
+	for try := range uint8(5) {
 		a16 := ip.As16()
 		hashData := a16[len(a16)-3:]
 		hashData[0] += try
@@ -182,7 +191,7 @@ func (pln *peerAPIListener) ServeConn(src netip.AddrPort, c net.Conn) {
 		c.Close()
 		return
 	}
-	nm := pln.lb.NetMap()
+	nm := pln.lb.NetMapNoPeers()
 	if nm == nil || !nm.SelfNode.Valid() {
 		logf("peerapi: no netmap")
 		c.Close()
@@ -664,6 +673,12 @@ func (h *peerAPIHandler) handleServeDNSFwd(w http.ResponseWriter, r *http.Reques
 	dh.ServeHTTP(w, r)
 }
 
+// HookReplyToDNSQueries allows extensions to register a willingness to allow
+// handling PeerAPI DNS queries for the peer making this request.
+var HookReplyToDNSQueries = feature.Hooks[func(PeerAPIHandler) bool]{
+	offersExitNodeOrAppConnectorAndPeerHasAutogroupInternet,
+}
+
 func (h *peerAPIHandler) replyToDNSQueries() bool {
 	if !buildfeatures.HasDNS {
 		return false
@@ -673,15 +688,34 @@ func (h *peerAPIHandler) replyToDNSQueries() bool {
 		// without further checks.
 		return true
 	}
-	b := h.ps.b
-	if !b.OfferingExitNode() && !b.OfferingAppConnector() {
-		// If we're not an exit node or app connector, there's
-		// no point to being a DNS server for somebody.
-		return false
-	}
 	if !h.remoteAddr.IsValid() {
 		// This should never be the case if the peerAPIHandler
 		// was wired up correctly, but just in case.
+		return false
+	}
+
+	for _, hook := range HookReplyToDNSQueries {
+		if hook(h) {
+			return true
+		}
+	}
+	return false
+}
+
+// offersExitNodeOrAppConnectorAndPeerHasAutogroupInternet is run as part of
+// [HookReplyToDNSQueries] and handles our legacy PeerAPI DNS acceptance
+// criteria:
+//   - When a node is advertising an exit node it will accept DNS queries
+//     from peers that have access to autogroup:internet.
+//   - When a node is advertising an app connector, it will accept DNS queries
+//     to peers that have access to a relevant app.
+//
+// Further details about how these are accomplished are in inline comments.
+func offersExitNodeOrAppConnectorAndPeerHasAutogroupInternet(h PeerAPIHandler) bool {
+	b := h.LocalBackend()
+	if !b.OfferingExitNode() && !b.OfferingAppConnector() {
+		// If we're not an exit node or app connector, this hook
+		// doesn't apply.
 		return false
 	}
 	// Otherwise, we're an exit node but the peer is not us, so
@@ -706,7 +740,7 @@ func (h *peerAPIHandler) replyToDNSQueries() bool {
 	// arbitrary. DNS runs over TCP and UDP, so sure... we check
 	// TCP.
 	dstIP := netaddr.IPv4(0, 0, 0, 0)
-	remoteIP := h.remoteAddr.Addr()
+	remoteIP := h.RemoteAddr().Addr()
 	if remoteIP.Is6() {
 		// autogroup:internet for IPv6 is defined to start with 2000::/3,
 		// so use 2000::0 as the probe "the internet" address.

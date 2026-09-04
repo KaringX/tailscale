@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package filelogger provides localdisk log writing & rotation, primarily for Windows
@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sagernet/tailscale/tstime"
 	"github.com/sagernet/tailscale/types/logger"
 )
 
@@ -106,13 +107,8 @@ func (w *logFileWriter) appendToFileLocked(out []byte) {
 	}
 	out = removeDatePrefix(out)
 	if w.f != nil {
-		// RFC3339Nano but with a fixed number (3) of nanosecond digits:
-		const formatPre = "2006-01-02T15:04:05"
-		const formatPost = "Z07:00"
-		fmt.Fprintf(w.f, "%s.%03d%s: %s",
-			now.Format(formatPre),
-			now.Nanosecond()/int(time.Millisecond/time.Nanosecond),
-			now.Format(formatPost),
+		fmt.Fprintf(w.f, "%s: %s",
+			now.Format(tstime.DateTTimeMilliZ),
 			out)
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package mem provides an in-memory ipn.StateStore implementation.
@@ -49,7 +49,11 @@ func (s *Store) WriteState(id ipn.StateKey, bs []byte) error {
 	if s.cache == nil {
 		s.cache = map[ipn.StateKey][]byte{}
 	}
-	s.cache[id] = bytes.Clone(bs)
+	if bs == nil {
+		delete(s.cache, id)
+	} else {
+		s.cache[id] = bytes.Clone(bs)
+	}
 	return nil
 }
 

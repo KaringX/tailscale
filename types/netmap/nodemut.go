@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package netmap
@@ -10,9 +10,10 @@ import (
 	"slices"
 	"sync"
 	"time"
+	time2 "time"
 
+	godownreflect "github.com/sagernet/tailscale/internal/godown/std/reflect"
 	"github.com/sagernet/tailscale/tailcfg"
-	"github.com/sagernet/tailscale/types/ptr"
 )
 
 // NodeMutation is the common interface for types that describe
@@ -55,7 +56,7 @@ type NodeMutationOnline struct {
 }
 
 func (m NodeMutationOnline) Apply(n *tailcfg.Node) {
-	n.Online = ptr.To(m.Online)
+	n.Online = func() *bool { godownValue := m.Online; return &godownValue }()
 }
 
 // NodeMutationLastSeen is a NodeMutation that says a node's LastSeen
@@ -66,14 +67,42 @@ type NodeMutationLastSeen struct {
 }
 
 func (m NodeMutationLastSeen) Apply(n *tailcfg.Node) {
-	n.LastSeen = ptr.To(m.LastSeen)
+	n.LastSeen = func() *time2.Time { godownValue := m.LastSeen; return &godownValue }()
+}
+
+// NodeMutationUpsert is a NodeMutation that says a peer's full Node value
+// should be inserted or replaced.
+//
+// Apply is a no-op: consumers of NodeMutationUpsert must type-switch to handle
+// upserts by storing Node in their peer map.
+type NodeMutationUpsert struct {
+	Node tailcfg.NodeView
+}
+
+func (m NodeMutationUpsert) NodeIDBeingMutated() tailcfg.NodeID { return m.Node.ID() }
+func (m NodeMutationUpsert) Apply(*tailcfg.Node)                {}
+
+// NodeMutationRemove is a NodeMutation that says a peer has been removed.
+// Apply is a no-op: consumers of NodeMutationRemove must type-switch to handle
+// removes by deleting the node from their peer map.
+type NodeMutationRemove struct {
+	mutatingNodeID
+}
+
+func (m NodeMutationRemove) Apply(*tailcfg.Node) {}
+
+// MakeNodeMutationRemove returns a NodeMutationRemove that targets nodeID.
+// It is the constructor for NodeMutationRemove for callers outside this
+// package, since the embedded ID field is unexported.
+func MakeNodeMutationRemove(nodeID tailcfg.NodeID) NodeMutationRemove {
+	return NodeMutationRemove{mutatingNodeID(nodeID)}
 }
 
 var peerChangeFields = sync.OnceValue(func() []reflect.StructField {
 	var fields []reflect.StructField
 	rt := reflect.TypeFor[tailcfg.PeerChange]()
-	for i := range rt.NumField() {
-		fields = append(fields, rt.Field(i))
+	for field := range godownreflect.TypeFields(rt) {
+		fields = append(fields, field)
 	}
 	return fields
 })
@@ -111,8 +140,14 @@ func NodeMutationsFromPatch(p *tailcfg.PeerChange) (_ []NodeMutation, ok bool) {
 }
 
 // MutationsFromMapResponse returns all the discrete node mutations described
-// by res. It returns ok=false if res contains any non-patch field as defined
+// by res. It returns ok=false if res contains any non-delta field as defined
 // by mapResponseContainsNonPatchFields.
+//
+// Upserts and removes (from res.PeersChanged / res.PeersRemoved) are emitted
+// as NodeMutationUpsert / NodeMutationRemove entries. A PeersChanged entry can
+// be either a new peer or a full replacement for an existing peer that couldn't
+// be represented as PeerChangedPatch. Callers must type-switch to handle those
+// alongside field mutations.
 func MutationsFromMapResponse(res *tailcfg.MapResponse, now time.Time) (ret []NodeMutation, ok bool) {
 	if now.IsZero() {
 		now = time.Now()
@@ -120,8 +155,15 @@ func MutationsFromMapResponse(res *tailcfg.MapResponse, now time.Time) (ret []No
 	if mapResponseContainsNonPatchFields(res) {
 		return nil, false
 	}
-	// All that remains is PeersChangedPatch, OnlineChange, and LastSeenChange.
 
+	for _, id := range res.PeersRemoved {
+		ret = append(ret, NodeMutationRemove{mutatingNodeID(id)})
+	}
+	for _, n := range res.PeersChanged {
+		// Any n still in PeersChanged after patchifyPeersChanged is a
+		// truly-new (or replaced) peer.
+		ret = append(ret, NodeMutationUpsert{Node: n.View()})
+	}
 	for _, p := range res.PeersChangedPatch {
 		deltas, ok := NodeMutationsFromPatch(p)
 		if !ok {
@@ -143,25 +185,26 @@ func MutationsFromMapResponse(res *tailcfg.MapResponse, now time.Time) (ret []No
 	return ret, true
 }
 
-// mapResponseContainsNonPatchFields reports whether res contains only "patch"
-// fields set (PeersChangedPatch primarily, but also including the legacy
-// PeerSeenChange and OnlineChange fields).
+// mapResponseContainsNonPatchFields reports whether res contains any field
+// that can't be expressed as a per-peer NodeMutation (including the new
+// NodeMutationUpsert / NodeMutationRemove variants) or via the sibling narrow
+// setter methods on the map-session backend (e.g. UpdatePacketFilter).
 //
-// It ignores any of the meta fields that are handled by PollNetMap before the
-// peer change handling gets involved.
+// When this returns true, the caller must fall back to rebuilding and
+// dispatching a full NetworkMap. When it returns false, the response can be
+// handled incrementally.
 //
-// The purpose of this function is to ask whether this is a tricky enough
-// MapResponse to warrant a full netmap update. When this returns false, it
-// means the response can be handled incrementally, patching up the local state.
+// PeersChanged, PeersRemoved, and PacketFilter(s) are intentionally not in
+// this list: upserted/removed peers ride NodeMutationUpsert/Remove, packet
+// filter updates are delivered via the backend's UpdatePacketFilter
+// method, and UserProfile updates ride the backend's UpdateUserProfiles
+// method.
 func mapResponseContainsNonPatchFields(res *tailcfg.MapResponse) bool {
 	return res.Node != nil ||
 		res.DERPMap != nil ||
 		res.DNSConfig != nil ||
 		res.Domain != "" ||
 		res.CollectServices != "" ||
-		res.PacketFilter != nil ||
-		res.PacketFilters != nil ||
-		res.UserProfiles != nil ||
 		res.Health != nil ||
 		res.DisplayMessages != nil ||
 		res.SSHPolicy != nil ||
@@ -171,11 +214,5 @@ func mapResponseContainsNonPatchFields(res *tailcfg.MapResponse) bool {
 		res.ControlDialPlan != nil ||
 		res.ClientVersion != nil ||
 		res.Peers != nil ||
-		res.PeersRemoved != nil ||
-		// PeersChanged is too coarse to be considered a patch. Also, we convert
-		// PeersChanged to PeersChangedPatch in patchifyPeersChanged before this
-		// function is called, so it should never be set anyway. But for
-		// completedness, and for tests, check it too:
-		res.PeersChanged != nil ||
 		res.DeprecatedDefaultAutoUpdate != ""
 }

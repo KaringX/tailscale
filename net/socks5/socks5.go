@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package socks5 is a SOCKS5 server implementation.
@@ -21,6 +21,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"slices"
 	"strconv"
 	"time"
 
@@ -488,10 +489,8 @@ func parseClientGreeting(r io.Reader, authMethod byte) error {
 	if err != nil {
 		return fmt.Errorf("could not read methods")
 	}
-	for _, m := range methods {
-		if m == authMethod {
-			return nil
-		}
+	if slices.Contains(methods, authMethod) {
+		return nil
 	}
 	return fmt.Errorf("no acceptable auth methods")
 }

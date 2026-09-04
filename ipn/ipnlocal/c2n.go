@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package ipnlocal
@@ -44,9 +44,6 @@ func init() {
 		// several candidate nodes is reachable and actually alive.
 		RegisterC2N("/echo", handleC2NEcho)
 	}
-	if buildfeatures.HasSSH {
-		RegisterC2N("/ssh/usernames", handleC2NSSHUsernames)
-	}
 	if buildfeatures.HasLogTail {
 		RegisterC2N("POST /logtail/flush", handleC2NLogtailFlush)
 	}
@@ -86,6 +83,29 @@ func RegisterC2N(pattern string, h func(*LocalBackend, http.ResponseWriter, *htt
 	c2nHandlers[k] = h
 }
 
+// RegisterC2NPrefix registers h as the c2n handler for all paths starting
+// with prefix. prefix must end in "/". Prefix matches are tried after all
+// exact-path handlers registered via [RegisterC2N] fail to match.
+func RegisterC2NPrefix(prefix string, h func(*LocalBackend, http.ResponseWriter, *http.Request)) {
+	if !buildfeatures.HasC2N {
+		return
+	}
+	if prefix == "" || !strings.HasSuffix(prefix, "/") {
+		panic(fmt.Sprintf("c2n: prefix %q must be non-empty and end with /", prefix))
+	}
+	c2nPrefixHandlers = append(c2nPrefixHandlers, c2nPrefixHandler{prefix, h})
+}
+
+// c2nPrefixHandler is a c2n handler that matches all paths starting with prefix.
+type c2nPrefixHandler struct {
+	prefix string
+	h      c2nHandler
+}
+
+// c2nPrefixHandlers are c2n handlers matched by URL path prefix rather than
+// exact path. See [RegisterC2NPrefix].
+var c2nPrefixHandlers []c2nPrefixHandler
+
 type c2nHandler func(*LocalBackend, http.ResponseWriter, *http.Request)
 
 type methodAndPath struct {
@@ -120,6 +140,13 @@ func (b *LocalBackend) handleC2N(w http.ResponseWriter, r *http.Request) {
 	if h, ok := c2nHandlers[methodAndPath{path: r.URL.Path}]; ok {
 		h(b, w, r)
 		return
+	}
+	// Then try prefix matches.
+	for _, ph := range c2nPrefixHandlers {
+		if strings.HasPrefix(r.URL.Path, ph.prefix) {
+			ph.h(b, w, r)
+			return
+		}
 	}
 	if c2nHandlerPaths.Contains(r.URL.Path) {
 		http.Error(w, "bad method", http.StatusMethodNotAllowed)
@@ -288,26 +315,6 @@ func handleC2NPprof(b *LocalBackend, w http.ResponseWriter, r *http.Request) {
 	}
 	_, profile := path.Split(r.URL.Path)
 	c2nPprof(w, r, profile)
-}
-
-func handleC2NSSHUsernames(b *LocalBackend, w http.ResponseWriter, r *http.Request) {
-	if !buildfeatures.HasSSH {
-		http.Error(w, feature.ErrUnavailable.Error(), http.StatusNotImplemented)
-		return
-	}
-	var req tailcfg.C2NSSHUsernamesRequest
-	if r.Method == "POST" {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-	}
-	res, err := b.getSSHUsernames(&req)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	writeJSON(w, res)
 }
 
 func handleC2NSockStats(b *LocalBackend, w http.ResponseWriter, r *http.Request) {

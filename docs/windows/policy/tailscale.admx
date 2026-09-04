@@ -231,7 +231,7 @@
         <string>never</string>
       </disabledValue>
     </policy>
-    <policy name="DNSRegistration" class="Machine" displayName="$(string.DNSRegistration)" explainText="$(string.DNSRegistration_Help)" presentation="$(presentation.DNSRegistration)" key="Software\Policies\Tailscale" valueName="EnableDNSRegistration">
+    <policy name="DNSRegistration" class="Machine" displayName="$(string.DNSRegistration)" explainText="$(string.DNSRegistration_Help)" presentation="$(presentation.DNSRegistration)" key="Software\Policies\Tailscale" valueName="DNSRegistrationConfigured">
       <parentCategory ref="Settings_Category" />
       <supportedOn ref="SINCE_V1_84" />
       <elements>
@@ -250,6 +250,16 @@
       </elements>
     </policy>
     <policy name="InstallUpdates" class="Machine" displayName="$(string.InstallUpdates)" explainText="$(string.InstallUpdates_Help)" key="Software\Policies\Tailscale" valueName="InstallUpdates">
+      <parentCategory ref="Settings_Category" />
+      <supportedOn ref="PARTIAL_FULL_SINCE_V1_56" />
+      <enabledValue>
+        <string>always</string>
+      </enabledValue>
+      <disabledValue>
+        <string>never</string>
+      </disabledValue>
+    </policy>
+    <policy name="CheckUpdates" class="Machine" displayName="$(string.CheckUpdates)" explainText="$(string.CheckUpdates_Help)" key="Software\Policies\Tailscale" valueName="CheckUpdates">
       <parentCategory ref="Settings_Category" />
       <supportedOn ref="PARTIAL_FULL_SINCE_V1_56" />
       <enabledValue>

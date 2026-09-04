@@ -1,4 +1,4 @@
-// Copyright (c) Tailscale Inc & AUTHORS
+// Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
 package compositedav
@@ -63,7 +63,7 @@ func (h *Handler) delegateRewriting(w http.ResponseWriter, r *http.Request, path
 
 	// Fixup paths to add the requested path as a prefix, escaped for inclusion in XML.
 	pp := shared.EscapeForXML(shared.Join(pathComponents[0:mpl]...))
-	b := responseHrefRegex.ReplaceAll(bw.buf.Bytes(), []byte(fmt.Sprintf("$1<D:href>%s/$3</D:href>", pp)))
+	b := responseHrefRegex.ReplaceAll(bw.buf.Bytes(), fmt.Appendf(nil, "$1<D:href>%s/$3</D:href>", pp))
 	return bw.status, b
 }
 
