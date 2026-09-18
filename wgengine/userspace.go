@@ -56,7 +56,6 @@ import (
 	"github.com/sagernet/tailscale/version"
 	"github.com/sagernet/tailscale/wgengine/filter"
 	"github.com/sagernet/tailscale/wgengine/magicsock"
-	"github.com/sagernet/tailscale/wgengine/netstack/gro"
 	"github.com/sagernet/tailscale/wgengine/router"
 	"github.com/sagernet/tailscale/wgengine/wgcfg"
 	"github.com/sagernet/tailscale/wgengine/wgint"
@@ -115,11 +114,11 @@ type userspaceEngine struct {
 	// for the cold-path control lookups (Ping, TSMP, pendopen, etc).
 	peerForIPFn atomic.Pointer[func(netip.Addr) (_ PeerForIP, ok bool)]
 
-	// peerConfigFn, if non-nil, is the live per-peer allowed-IPs
+	// peerConfigFn, if non-nil, is the live per-peer config
 	// source installed via [userspaceEngine.SetPeerConfigFunc]. When
 	// set, wgdev's PeerLookupFunc queries it directly, so reconfigs
 	// no longer install per-config lookup closures.
-	peerConfigFn atomic.Pointer[func(key.NodePublic) (allowedIPs []netip.Prefix, ok bool)]
+	peerConfigFn atomic.Pointer[func(key.NodePublic) (config wgcfg.PeerConfig, ok bool)]
 
 	lastCfg        wgcfg.Config
 	lastRouter     *router.Config
@@ -407,7 +406,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	if conf.NetMon != nil {
 		e.netMon = conf.NetMon
 	} else {
-		mon, err := netmon.New(conf.EventBus, logf, nil)
+		mon, err := netmon.New(conf.EventBus, logf, netmon.Hooks{})
 		if err != nil {
 			return nil, err
 		}
@@ -646,7 +645,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 }
 
 // echoRespondToAll is an inbound post-filter responding to all echo requests.
-func echoRespondToAll(p *packet.Parsed, t *tstun.Wrapper, gro *gro.GRO) (filter.Response, *gro.GRO) {
+func echoRespondToAll(p *packet.Parsed, t *tstun.Wrapper) filter.Response {
 	if p.IsEchoRequest() {
 		header := p.ICMP4Header()
 		header.ToResponse()
@@ -658,9 +657,9 @@ func echoRespondToAll(p *packet.Parsed, t *tstun.Wrapper, gro *gro.GRO) (filter.
 		// it away. If this ever gets run in non-fake mode, you'll
 		// get double responses to pings, which is an indicator you
 		// shouldn't be doing that I guess.)
-		return filter.Accept, gro
+		return filter.Accept
 	}
-	return filter.Accept, gro
+	return filter.Accept
 }
 
 // handleLocalPackets inspects packets coming from the local network
@@ -702,12 +701,12 @@ func (e *userspaceEngine) handleLocalPackets(p *packet.Parsed, t *tstun.Wrapper)
 // fn and installs a single wgdev PeerLookupFunc wrapping it, so
 // lazily-created peers always get current allowed IPs and the lookup
 // func never needs to be reinstalled as the peer set changes.
-func (e *userspaceEngine) SetPeerConfigFunc(fn func(key.NodePublic) (allowedIPs []netip.Prefix, ok bool)) {
+func (e *userspaceEngine) SetPeerConfigFunc(fn func(key.NodePublic) (config wgcfg.PeerConfig, ok bool)) {
 	if fn == nil {
 		panic("SetPeerConfigFunc: nil fn")
 	}
 	e.peerConfigFn.Store(&fn)
-	e.wgdev.SetPeerLookupFunc(wgcfg.NewPeerLookupFunc(e.wgdev.Bind(), e.logf, func(pubk device.NoisePublicKey) ([]netip.Prefix, bool) {
+	e.wgdev.SetPeerLookupFunc(wgcfg.NewPeerLookupFunc(e.wgdev.Bind(), e.logf, func(pubk device.NoisePublicKey) (wgcfg.PeerConfig, bool) {
 		return fn(key.NodePublicFromRaw32(mem.B(pubk[:])))
 	}))
 }
@@ -723,13 +722,14 @@ func (e *userspaceEngine) SyncDevicePeer(k key.NodePublic) {
 	// The peer set may be about to change; drop the wgLogger's cached
 	// peer-string rewrites so the next log line re-resolves them.
 	e.wgLogger.Invalidate()
-	allowedIPs, ok := (*fn)(k)
+	conf, ok := (*fn)(k)
 	if !ok {
 		e.wgdev.RemovePeer(k.Raw32())
 		return
 	}
 	if peer, ok := e.wgdev.LookupActivePeer(k.Raw32()); ok {
-		peer.SetAllowedIPs(allowedIPs)
+		peer.SetPresharedKey(conf.PresharedKey)
+		peer.SetAllowedIPs(conf.AllowedIPs)
 	}
 }
 

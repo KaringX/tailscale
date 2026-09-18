@@ -623,7 +623,7 @@ func NewLocalBackend(logf logger.Logf, logID logid.PublicID, sys *tsd.System, lo
 	nb.ready()
 
 	e.SetPeerByIPPacketFunc(b.lookupPeerByIP)
-	e.SetPeerConfigFunc(b.peerAllowedIPs)
+	e.SetPeerConfigFunc(b.peerConfig)
 	e.SetPeerForIPFunc(b.PeerForIP)
 	e.SetPeerSessionStateFunc(b.onPeerWireGuardState)
 	e.SetNetLogSource(netLogNodeSource{b})
@@ -1366,6 +1366,13 @@ func (b *LocalBackend) Shutdown() {
 	if cc != nil {
 		cc.Shutdown()
 	}
+	b.mu.Lock()
+	if b.nmExpiryTimer != nil {
+		b.nmExpiryTimer.Stop()
+		b.nmExpiryTimer = nil
+		b.numClientStatusCalls.Add(1)
+	}
+	b.mu.Unlock()
 	if buildfeatures.HasRuntimeMetrics {
 		// We disable runtime metrics _after_ the control client is shutdown to
 		// ensure we don't leak the metrics polling goroutine in the case where
