@@ -19,7 +19,7 @@ func NewDevice(ctx context.Context, tunDev tun.Device, bind conn.Bind, logger *d
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return device.NewDevice(ctx, tunDev, bind, logger, workers)
+	return device.NewDevice(ctx, tunDev, bind, logger, workers, 0, false) //https://github.com/shtorm-7/sing-box-extended
 }
 
 // NewPeerLookupFunc returns a [device.PeerLookupFunc] that lazily
