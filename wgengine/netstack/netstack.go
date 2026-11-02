@@ -223,7 +223,7 @@ func (ns *Impl) ListenPacket(network, address string) (net.PacketConn, error) {
 	return conn, nil
 }
 
-func (ns *Impl) inject(packets []*buf.Buffer) error {
+func (ns *Impl) inject(packets []*buf.Buffer) {
 	outbound := packets[:0]
 	for index, buffer := range packets {
 		var parsed packet.Parsed
@@ -241,10 +241,14 @@ func (ns *Impl) inject(packets []*buf.Buffer) error {
 		if err != nil {
 			buf.ReleaseMulti(outbound)
 			buf.ReleaseMulti(packets[index+1:])
-			return err
+			ns.logf("[v2] netstack: inject: %v", err)
+			return
 		}
 	}
-	return ns.tundev.InjectOutboundBuffers(ns.ctx, outbound)
+	err := ns.tundev.InjectOutboundBuffers(ns.ctx, outbound)
+	if err != nil {
+		ns.logf("[v2] netstack: inject: %v", err)
+	}
 }
 
 func (ns *Impl) shouldSendToHost(parsed *packet.Parsed) bool {
@@ -298,13 +302,27 @@ func (ns *Impl) shouldProcessInbound(parsed *packet.Parsed) bool {
 }
 
 func (ns *Impl) JudgeFlow(protocol uint8, source, destination netip.AddrPort, firstPacket []byte) tun.FlowVerdict {
-	if ns.Handler == nil || ns.isLocalIP(destination.Addr()) || destination.Addr() == serviceIP || destination.Addr() == serviceIPv6 || ns.isVIPServiceIP(destination.Addr()) || viaRange.Contains(destination.Addr()) {
+	if ns.Handler == nil || destination.Addr() == serviceIP || destination.Addr() == serviceIPv6 || ns.isVIPServiceIP(destination.Addr()) || viaRange.Contains(destination.Addr()) {
 		return tun.FlowVerdict{Action: tun.ActionAccept}
 	}
 	if ns.HasListenerForDestination != nil && ns.HasListenerForDestination(protocol, destination) {
 		return tun.FlowVerdict{Action: tun.ActionAccept}
 	}
+	if ns.isLocalIP(destination.Addr()) && ns.interceptsLocalPort(protocol, destination) {
+		return tun.FlowVerdict{Action: tun.ActionAccept}
+	}
 	return ns.Handler.JudgeFlow(protocol, source, destination, firstPacket)
+}
+
+func (ns *Impl) interceptsLocalPort(protocol uint8, destination netip.AddrPort) bool {
+	if ns.lb == nil || ipproto.Proto(protocol) != ipproto.TCP {
+		return false
+	}
+	peerAPIPort, found := ns.lb.GetPeerAPIPort(destination.Addr())
+	if found && destination.Port() == peerAPIPort {
+		return true
+	}
+	return ns.lb.ShouldInterceptTCPPort(destination.Port())
 }
 
 func (ns *Impl) NewDNSPacket(payload []byte, source, destination M.Socksaddr, writer N.PacketWriter) {

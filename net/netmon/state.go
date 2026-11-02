@@ -588,7 +588,7 @@ var getPAC func() string
 // It does not set the returned State.IsExpensive. The caller can populate that.
 //
 // optTSInterfaceName is the name of the Tailscale interface, if known.
-func getState(optTSInterfaceName string) (*State, error) {
+func getState(optTSInterfaceName string, getDefaultRoute func() (DefaultRouteDetails, error)) (*State, error) {
 	s := &State{
 		InterfaceIPs: make(map[string][]netip.Prefix),
 		Interface:    make(map[string]Interface),
@@ -619,7 +619,10 @@ func getState(optTSInterfaceName string) (*State, error) {
 		return nil, err
 	}
 
-	dr, _ := DefaultRoute()
+	if getDefaultRoute == nil {
+		getDefaultRoute = DefaultRoute
+	}
+	dr, _ := getDefaultRoute()
 	s.DefaultRouteInterface = dr.InterfaceName
 
 	// Populate description (for Windows, primarily) if present.

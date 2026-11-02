@@ -427,7 +427,7 @@ func (m *Monitor) ProbeLocks() {
 }
 
 func (m *Monitor) interfaceStateUncached() (*State, error) {
-	return getState(tsIfProps.tsIfName())
+	return getState(tsIfProps.tsIfName(), m.hooks.DefaultRoute)
 }
 
 // GatewayAndSelfIP returns the current network's default gateway, and
